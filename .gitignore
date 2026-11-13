@@ -1,0 +1,9 @@
+/target
+result
+result-*
+.direnv
+.pre-commit-config.yaml
+.claude/
+
+# Internal notes: plans, reviews, guides
+/docs/
