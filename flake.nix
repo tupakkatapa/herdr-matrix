@@ -105,10 +105,50 @@
                   };
                 };
               };
-              eval = config:
+              evalWith = args: config:
                 (lib.evalModules {
                   modules = [ self.homeModules.default home config ];
-                  specialArgs = { inherit pkgs; };
+                  specialArgs = { inherit pkgs; } // args;
+                }).config;
+              eval = evalWith { };
+              # The parts of NixOS the gate's module reads and writes
+              system = {
+                options = {
+                  users.users = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.anything;
+                    default = { };
+                  };
+                  users.groups = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.anything;
+                    default = { };
+                  };
+                  environment.systemPackages = lib.mkOption {
+                    type = lib.types.listOf lib.types.anything;
+                    default = [ ];
+                  };
+                  systemd.sockets = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.anything;
+                    default = { };
+                  };
+                  systemd.services = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.anything;
+                    default = { };
+                  };
+                };
+              };
+              # `home-manager.users` of Home Manager's NixOS module, with the home module
+              homeManager = { config, ... }: {
+                options.home-manager.users = lib.mkOption {
+                  type = lib.types.attrsOf (lib.types.submoduleWith {
+                    modules = [ self.homeModules.default home ];
+                    specialArgs = { inherit pkgs; osConfig = config; };
+                  });
+                  default = { };
+                };
+              };
+              nixos = modules:
+                (lib.evalModules {
+                  modules = [ self.nixosModules.default system ] ++ modules;
                 }).config;
               matrix = {
                 enable = true;
@@ -118,6 +158,9 @@
                 avatar = "/a.png";
               };
               bare = eval { programs.herdr = { enable = true; inherit matrix; }; };
+              gate = { enable = true; tokenFile = "/run/gate-token"; };
+              os = { herdr-matrix.gate.present = true; };
+              gated = args: evalWith args { programs.herdr = { enable = true; matrix = matrix // { inherit gate; }; }; };
               hears = eval {
                 programs.herdr = {
                   enable = true;
@@ -259,19 +302,49 @@
                   test "$(wc -l < restarts)" = 1
                   touch $out
                 '';
-              # Every option of the gate's module documents
-              gate-options =
-                (pkgs.nixosOptionsDoc {
-                  options =
-                    (lib.evalModules {
-                      modules = [ self.nixosModules.default { _module.check = false; } ];
-                      specialArgs = { inherit pkgs; };
-                    }).options.services.herdr-matrix-gate;
-                }).optionsJSON;
+              # The gate needs the bot and the NixOS module, and leaves the bot's units alone
+              module-gate =
+                let
+                  needsOs = config: lib.any (a: !a.assertion && lib.hasInfix "nixosModules.default" a.message) config.assertions;
+                in
+                pass "herdr-matrix-module-gate" (
+                  needsOs (gated { })
+                  && needsOs (gated { osConfig = null; })
+                  && needsOs (gated { osConfig = { }; })
+                  && lib.all (a: a.assertion) (gated { osConfig = os; }).assertions
+                  && (gated { osConfig = os; }).systemd.user == bare.systemd.user
+                  && lib.elem
+                    {
+                      assertion = false;
+                      message = "programs.herdr.matrix.gate.enable needs programs.herdr.matrix.enable.";
+                    }
+                    (evalWith { osConfig = os; } { programs.herdr.matrix.gate = gate; }).assertions
+                );
+              # Without a user with the gate on, the system holds no gate unit, user or group
+              gate-module =
+                let
+                  empty = config:
+                    config.herdr-matrix.gate.present
+                    && config.systemd.sockets == { }
+                    && config.systemd.services == { }
+                    && config.users.users == { }
+                    && config.users.groups == { }
+                    && config.environment.systemPackages == [ ];
+                in
+                pass "herdr-matrix-gate-module" (
+                  empty (nixos [ ])
+                  && empty (nixos [
+                    homeManager
+                    {
+                      home-manager.users.alice.programs.herdr = { enable = true; inherit matrix; };
+                      home-manager.users.bob = { };
+                    }
+                  ])
+                );
             }
             // lib.optionalAttrs pkgs.stdenv.isLinux {
               gate = import ./gate-test.nix {
-                inherit pkgs;
+                inherit pkgs homeManager;
                 module = self.nixosModules.default;
               };
             };

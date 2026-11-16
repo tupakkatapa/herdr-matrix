@@ -1,6 +1,6 @@
 # The chat gate in a VM, against a homeserver of a few lines that answers
 # only with the token of `tokenFile`
-{ pkgs, module }:
+{ pkgs, module, homeManager }:
 let
   homeserver = pkgs.writeText "homeserver.py" ''
     import json
@@ -69,15 +69,24 @@ in
 pkgs.testers.runNixOSTest {
   name = "herdr-matrix-gate";
   nodes.machine = {
-    imports = [ module ];
+    imports = [ module homeManager ];
     users.users.alice.isNormalUser = true;
     users.users.bob.isNormalUser = true;
-    services.herdr-matrix-gate = {
+    home-manager.users.alice.programs.herdr = {
       enable = true;
-      homeserver = "http://127.0.0.1:8008";
-      tokenFile = "/run/gate-token";
-      users = [ "alice" ];
+      matrix = {
+        enable = true;
+        homeserver = "http://127.0.0.1:8008";
+        owner = "@owner:x";
+        environmentFile = "/run/env";
+        avatar = "/a.png";
+        gate = {
+          enable = true;
+          tokenFile = "/run/gate-token";
+        };
+      };
     };
+    home-manager.users.bob = { };
     systemd.services.homeserver = {
       wantedBy = [ "multi-user.target" ];
       serviceConfig.ExecStart = "${pkgs.python3.interpreter} ${homeserver}";
@@ -96,6 +105,7 @@ pkgs.testers.runNixOSTest {
     refused = machine.fail("sudo -u alice herdr-matrix chats send '!herdr:x' hi 2>&1")
     assert refused.strip() == "not a bridged chat", refused
 
+    machine.fail("systemctl cat herdr-matrix-gate-bob.socket")
     bob = machine.fail("sudo -u bob herdr-matrix chats rooms 2>&1")
     assert bob.strip() == "the gate is not set up for this user", bob
     denied = machine.fail(

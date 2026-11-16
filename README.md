@@ -105,22 +105,22 @@ programs.herdr.matrix.agents.assistant = {
 
 ## Chats for the agents
 
-The chat gate lets the agents read, search and send in your bridged chats with your own Matrix account. It is a NixOS module, apart from the bot:
+The chat gate lets the agents read, search and send in your bridged chats with your own Matrix account. It runs as a system service, set up in the same block as the bot:
 
 ```nix
-# NixOS
-{
-  imports = [ inputs.herdr-matrix.nixosModules.default ];
-  services.herdr-matrix-gate = {
+programs.herdr.matrix = {
+  enable = true;
+  homeserver = "https://matrix.example.org";
+  gate = {
     enable = true;
-    homeserver = "https://matrix.example.org";
     tokenFile = "/run/agenix/matrix-gate-token"; # your own access token
-    users = [ "alice" ];
     bridges = [ "whatsapp" "signal" "telegram" ]; # the default
-    bot = "herdr"; # the default
+    bot = "herdr"; # the default: the sender_localpart of the bot's registration
   };
-}
+};
 ```
+
+The NixOS configuration must import `inputs.herdr-matrix.nixosModules.default`, which makes the system user, the socket and the service. Standalone Home Manager cannot run the gate.
 
 ```sh
 herdr-matrix chats rooms
@@ -132,7 +132,8 @@ herdr-matrix chats send <room> <text>...
 Each command prints JSON, or one line of error and exit code 1. `herdr-matrix` is on the system path while the gate is enabled.
 
 - Your token is your account: with it, a process can answer the bot's permission prompts. The bot and the agents run as your user, so the token must stay out of that user's reach. Only the gate reads it, as a systemd credential, under its own system user.
-- Each user in `users` gets a socket that only that user can open.
+- Each user with `gate.enable` gets a socket that only that user can open.
+- The gate options are system configuration: systemd reads `tokenFile` as root and sends the token to `homeserver`. Do not let an untrusted user write `home-manager.users.<user>`.
 - The gate serves only rooms with a bridged contact on your server, and refuses every room that holds the bot or one of its users.
 - Messages from other people are untrusted input for the agent; say so in its instructions.
 

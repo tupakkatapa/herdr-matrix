@@ -4,9 +4,12 @@
 , config
 , pkgs
 , ...
-}:
+}@args:
 let
   cfg = config.programs.herdr;
+  # Only Home Manager's NixOS module passes it; the module system ignores a
+  # `? null` default on a module argument
+  osConfig = args.osConfig or null;
   stateDir = "${config.xdg.configHome}/herdr";
 
   # Models stay out of the closure: the service downloads them to the state directory
@@ -185,74 +188,113 @@ in
         '';
         description = "Settings per agent, each for the agent working in its {option}`cwd`. The attribute name is used in unit names only.";
       };
+      gate = {
+        enable = lib.mkEnableOption ''
+          the chat gate: this user's agents read, search and send in the owner's bridged chats with `herdr-matrix chats`.
+          It needs {option}`programs.herdr.matrix.enable` and the NixOS module `herdr-matrix.nixosModules.default`, which runs it; standalone Home Manager cannot.
+          The user gets the socket `/run/herdr-matrix-gate/<user>`, which only that user can open, and the system units `herdr-matrix-gate-<user>.socket` and `herdr-matrix-gate-<user>@.service`.
+          The gate runs as the system user `herdr-matrix-gate`, one process per request, and refuses every room that holds the bot or one of its users.
+          These options are system configuration: systemd reads {option}`tokenFile` as root and sends the token to {option}`programs.herdr.matrix.homeserver`. Do not let an untrusted user write this Home Manager configuration.
+          `journalctl -u 'herdr-matrix-gate-*'` shows one line per request: the command and the outcome, never the token, a message or a room name
+        '';
+        tokenFile = lib.mkOption {
+          type = lib.types.externalPath;
+          example = "/run/agenix/matrix-gate-token";
+          description = "File with the owner's access token, outside the Nix store. systemd passes it to the gate as a credential, so it may stay `root:root`, mode `0400`, out of this user's reach.";
+        };
+        bridges = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ "whatsapp" "signal" "telegram" ];
+          description = "Localpart prefixes of bridged contacts: a room is a bridged chat when a user `@<prefix>_…` on the owner's server joined it.";
+        };
+        bot = lib.mkOption {
+          type = lib.types.str;
+          default = "herdr";
+          description = "Localpart of the bot, the `sender_localpart` of its appservice registration: a room with `@<bot>` or `@<bot>_…` on any server, joined, invited or knocking, is refused. A wrong value lifts that guard, and the owner's token reaches the bot's chats.";
+        };
+      };
     };
   };
 
-  config = lib.mkIf cfg.matrix.enable (lib.mkMerge [{
-    assertions = [{
-      assertion = cfg.enable;
-      message = "programs.herdr.matrix.enable needs programs.herdr.enable.";
-    }];
-    systemd.user.services.herdr-matrix = {
-      Unit = {
-        Description = "herdr Matrix bot";
-        After = [ "herdr.service" ];
-        Wants = lib.optional transcribes "herdr-matrix-models.service";
-      };
-      Service = {
-        ExecStart = lib.getExe cfg.matrix.package;
-        EnvironmentFile = cfg.matrix.environmentFile;
-        Environment = lib.mapAttrsToList env ({
-          PATH = lib.makeBinPath ([ cfg.package ]
-            ++ lib.optionals transcribes [ pkgs.ffmpeg-headless pkgs.whisper-cpp ]);
-          HERDR_MATRIX_STATE = stateDir;
-          HERDR_MATRIX_HOMESERVER = cfg.matrix.homeserver;
-          HERDR_MATRIX_OWNER = cfg.matrix.owner;
-          HERDR_MATRIX_NAME = cfg.matrix.displayName;
-          HERDR_MATRIX_AVATAR = "${cfg.matrix.avatar}";
-          HERDR_MATRIX_SPAWN_AVATAR = "${cfg.matrix.spawnAvatar}";
-          HERDR_MATRIX_SPAWN_PREFIX = lib.boolToString cfg.matrix.spawnPrefix;
+  config = lib.mkMerge [
+    (lib.mkIf cfg.matrix.gate.enable {
+      assertions = [
+        {
+          assertion = cfg.matrix.enable;
+          message = "programs.herdr.matrix.gate.enable needs programs.herdr.matrix.enable.";
         }
-        // lib.optionalAttrs transcribes {
-          HERDR_MATRIX_WHISPER_MODEL = modelPath cfg.matrix.transcribe.model;
-          HERDR_MATRIX_WHISPER_LANGUAGE = cfg.matrix.transcribe.language;
+        {
+          assertion = osConfig != null && (osConfig.herdr-matrix.gate.present or false);
+          message = "programs.herdr.matrix.gate.enable needs the NixOS module: import herdr-matrix.nixosModules.default in the NixOS configuration. Standalone Home Manager cannot run the gate.";
         }
-        // lib.optionalAttrs (cfg.matrix.agents != { }) {
-          HERDR_MATRIX_AGENTS = "${agentsFile}";
-        });
-        Restart = "on-failure";
-        RestartSec = 10;
+      ];
+    })
+    (lib.mkIf cfg.matrix.enable (lib.mkMerge [{
+      assertions = [{
+        assertion = cfg.enable;
+        message = "programs.herdr.matrix.enable needs programs.herdr.enable.";
+      }];
+      systemd.user.services.herdr-matrix = {
+        Unit = {
+          Description = "herdr Matrix bot";
+          After = [ "herdr.service" ];
+          Wants = lib.optional transcribes "herdr-matrix-models.service";
+        };
+        Service = {
+          ExecStart = lib.getExe cfg.matrix.package;
+          EnvironmentFile = cfg.matrix.environmentFile;
+          Environment = lib.mapAttrsToList env ({
+            PATH = lib.makeBinPath ([ cfg.package ]
+              ++ lib.optionals transcribes [ pkgs.ffmpeg-headless pkgs.whisper-cpp ]);
+            HERDR_MATRIX_STATE = stateDir;
+            HERDR_MATRIX_HOMESERVER = cfg.matrix.homeserver;
+            HERDR_MATRIX_OWNER = cfg.matrix.owner;
+            HERDR_MATRIX_NAME = cfg.matrix.displayName;
+            HERDR_MATRIX_AVATAR = "${cfg.matrix.avatar}";
+            HERDR_MATRIX_SPAWN_AVATAR = "${cfg.matrix.spawnAvatar}";
+            HERDR_MATRIX_SPAWN_PREFIX = lib.boolToString cfg.matrix.spawnPrefix;
+          }
+          // lib.optionalAttrs transcribes {
+            HERDR_MATRIX_WHISPER_MODEL = modelPath cfg.matrix.transcribe.model;
+            HERDR_MATRIX_WHISPER_LANGUAGE = cfg.matrix.transcribe.language;
+          }
+          // lib.optionalAttrs (cfg.matrix.agents != { }) {
+            HERDR_MATRIX_AGENTS = "${agentsFile}";
+          });
+          Restart = "on-failure";
+          RestartSec = 10;
+        };
+        Install.WantedBy = [ "default.target" ];
       };
-      Install.WantedBy = [ "default.target" ];
-    };
-    # Not ordered before the bot, which starts without the models it lacks
-    systemd.user.services.herdr-matrix-models = lib.mkIf transcribes {
-      Unit.Description = "herdr Matrix bot whisper model";
-      Service = {
-        Type = "oneshot";
-        ExecStart = lib.getExe fetchModels;
+      # Not ordered before the bot, which starts without the models it lacks
+      systemd.user.services.herdr-matrix-models = lib.mkIf transcribes {
+        Unit.Description = "herdr Matrix bot whisper model";
+        Service = {
+          Type = "oneshot";
+          ExecStart = lib.getExe fetchModels;
+        };
       };
-    };
-  }
-    {
-      systemd.user.services = lib.listToAttrs (map
-        (p: lib.nameValuePair p.name {
-          Unit = {
-            Description = p.description;
-            After = [ "herdr.service" "herdr-matrix.service" ];
-          };
-          Service = {
-            Type = "oneshot";
-            ExecStart = "${pkgs.writeShellScript p.name "exec ${lib.escapeShellArgs p.args}"}";
-          };
-        })
-        prompts);
-      systemd.user.timers = lib.listToAttrs (map
-        (p: lib.nameValuePair p.name {
-          Unit.Description = p.description;
-          Timer.OnCalendar = p.onCalendar;
-          Install.WantedBy = [ "timers.target" ];
-        })
-        prompts);
-    }]);
+    }
+      {
+        systemd.user.services = lib.listToAttrs (map
+          (p: lib.nameValuePair p.name {
+            Unit = {
+              Description = p.description;
+              After = [ "herdr.service" "herdr-matrix.service" ];
+            };
+            Service = {
+              Type = "oneshot";
+              ExecStart = "${pkgs.writeShellScript p.name "exec ${lib.escapeShellArgs p.args}"}";
+            };
+          })
+          prompts);
+        systemd.user.timers = lib.listToAttrs (map
+          (p: lib.nameValuePair p.name {
+            Unit.Description = p.description;
+            Timer.OnCalendar = p.onCalendar;
+            Install.WantedBy = [ "timers.target" ];
+          })
+          prompts);
+      }]))
+  ];
 }

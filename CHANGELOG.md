@@ -13,10 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `herdr-matrix prompt <agent> <text>`: queues a prompt that the running bot hands to the agent; the last message of its turn posts in the agent's own chat, else in the main chat.
 - The option `agents.<id>`: for the agent working in `cwd`, the `name`, `prefix` and `avatar` of its own chat user, and `prompts.<name>`, a prompt on a systemd calendar schedule (`herdr-matrix prompt --cwd <dir> <text>`).
 - The option `spawnPrefix`: off, the user of an agent's own chat has the agent's name alone. The name follows the agent when it changes.
-- The chat gate: the NixOS module `services.herdr-matrix-gate` and `herdr-matrix chats rooms|read|search|send`, with which agents read, search and send in the owner's bridged chats. Only the gate, under its own system user, reads the owner's token; it refuses every room of the bot.
+- The chat gate: the option `programs.herdr.matrix.gate` (`enable`, `tokenFile`, `bridges`, `bot`), run by the NixOS module `nixosModules.default`, and `herdr-matrix chats rooms|read|search|send`, with which agents read, search and send in the owner's bridged chats. Only the gate, under its own system user, reads the owner's token; it refuses every room of the bot.
 
 ### Changed
 
+- **Breaking:** the NixOS option `services.herdr-matrix-gate` is removed; the gate is set in Home Manager. Migration: move `enable`, `tokenFile`, `bridges` and `bot` to `programs.herdr.matrix.gate` of the user that was in `users`. `homeserver` and `package` come from `programs.herdr.matrix`. Keep the import of `nixosModules.default`.
 - The binary refuses unknown arguments with a usage message and exit code 2, and does not start the bot.
 
 ## [0.1.0]
