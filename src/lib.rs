@@ -4,9 +4,11 @@
 
 pub mod app;
 pub mod bot;
+pub mod chats;
 pub mod commands;
 pub mod error;
 pub mod files;
+pub mod gate;
 pub mod herdr;
 pub mod inbox;
 pub mod json;

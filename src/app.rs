@@ -52,7 +52,7 @@ impl fmt::Debug for Settings {
 
 /// True for an `https://` URL, or an `http://` one on this host: the
 /// token goes in clear text over plain HTTP.
-fn safe_url(url: &str) -> bool {
+pub(crate) fn safe_url(url: &str) -> bool {
     if url.starts_with("https://") {
         return true;
     }

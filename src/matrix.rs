@@ -458,7 +458,7 @@ impl Sync {
 }
 
 /// The user and membership of an `m.room.member` event.
-fn member(ev: &Value) -> Option<(&str, &str)> {
+pub(crate) fn member(ev: &Value) -> Option<(&str, &str)> {
     if ev.get("type").and_then(Value::as_str) != Some("m.room.member") {
         return None;
     }
@@ -469,7 +469,7 @@ fn member(ev: &Value) -> Option<(&str, &str)> {
 }
 
 /// True for a membership that lets a user read the room, or soon may.
-fn present(membership: &str) -> bool {
+pub(crate) fn present(membership: &str) -> bool {
     matches!(membership, "join" | "invite" | "knock")
 }
 

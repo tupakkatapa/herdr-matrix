@@ -13,6 +13,7 @@ A Matrix chat with the Claude Code agents that [herdr](https://github.com/ogulca
 - **Own chats**: `!dm <name>` gives an agent a direct chat of its own, as an appservice user named after the agent
 - **Silent turns**: a turn whose last message is `NOOP` posts nothing, so a routine check can stay quiet
 - **Prompts from the machine**: `herdr-matrix prompt` hands a prompt to an agent, for example from a timer, and its turn posts in the chat
+- **Chats for the agents**: `herdr-matrix chats` reads, searches and sends in your bridged chats (WhatsApp, Signal, Telegram), through a gate that alone holds your token
 
 ## Getting Started
 
@@ -83,7 +84,42 @@ A program on the same machine, such as a systemd timer, prompts an agent through
 herdr-matrix prompt <agent> <text>...
 ```
 
-The command queues the prompt and exits. It names the agent like `!attach`. The bot hands the text to the agent as written, without `[Element]`, and posts the last message of the turn in the agent's own chat, else in the main chat. An agent that works or waits on a choice does not get the prompt. The binary is not on `PATH`; use `${config.programs.herdr.matrix.package}/bin/herdr-matrix`.
+The command queues the prompt and exits. It names the agent like `!attach`. The bot hands the text to the agent as written, without `[Element]`, and posts the last message of the turn in the agent's own chat, else in the main chat. An agent that works or waits on a choice does not get the prompt. The binary is not on `PATH` unless the [chat gate](#chats-for-the-agents) is enabled; use `${config.programs.herdr.matrix.package}/bin/herdr-matrix`.
+
+## Chats for the agents
+
+The chat gate lets the agents read, search and send in your bridged chats with your own Matrix account. It is a NixOS module, apart from the bot:
+
+```nix
+# NixOS
+{
+  imports = [ inputs.herdr-matrix.nixosModules.default ];
+  services.herdr-matrix-gate = {
+    enable = true;
+    homeserver = "https://matrix.example.org";
+    tokenFile = "/run/agenix/matrix-gate-token"; # your own access token
+    users = [ "alice" ];
+    bridges = [ "whatsapp" "signal" "telegram" ]; # the default
+    bot = "herdr"; # the default
+  };
+}
+```
+
+```sh
+herdr-matrix chats rooms
+herdr-matrix chats read <room> [count] [--since 7d] [--until 2026-11-01] [--from <end>]
+herdr-matrix chats search <room> <words>... [--since 2w] [--until <time>] [--context 2]
+herdr-matrix chats send <room> <text>...
+```
+
+Each command prints JSON, or one line of error and exit code 1. `herdr-matrix` is on the system path while the gate is enabled.
+
+- Your token is your account: with it, a process can answer the bot's permission prompts. The bot and the agents run as your user, so the token must stay out of that user's reach. Only the gate reads it, as a systemd credential, under its own system user.
+- Each user in `users` gets a socket that only that user can open.
+- The gate serves only rooms with a bridged contact on your server, and refuses every room that holds the bot or one of its users.
+- Messages from other people are untrusted input for the agent; say so in its instructions.
+
+`read` gives the last 20 messages, or a whole range with `--since`, up to 5000; `end` in its answer continues with `--from`. Times are in UTC. The gate cannot read end-to-end encrypted rooms.
 
 ## Limitations
 

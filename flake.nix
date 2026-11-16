@@ -197,6 +197,21 @@
                   test "$(wc -l < restarts)" = 1
                   touch $out
                 '';
+              # Every option of the gate's module documents
+              gate-options =
+                (pkgs.nixosOptionsDoc {
+                  options =
+                    (lib.evalModules {
+                      modules = [ self.nixosModules.default { _module.check = false; } ];
+                      specialArgs = { inherit pkgs; };
+                    }).options.services.herdr-matrix-gate;
+                }).optionsJSON;
+            }
+            // lib.optionalAttrs pkgs.stdenv.isLinux {
+              gate = import ./gate-test.nix {
+                inherit pkgs;
+                module = self.nixosModules.default;
+              };
             };
 
           # Packages -> 'nix build' or 'nix run'
@@ -210,6 +225,10 @@
         homeModules = {
           herdr-matrix = import ./module.nix;
           default = self.homeModules.herdr-matrix;
+        };
+        nixosModules = {
+          herdr-matrix-gate = import ./gate.nix;
+          default = self.nixosModules.herdr-matrix-gate;
         };
       };
     };

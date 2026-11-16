@@ -3,10 +3,13 @@
 //! runs.
 
 use std::fs;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use herdr_matrix::herdr::{Herdr as _, RunHerdr};
@@ -187,4 +190,113 @@ fn herdr_timeout_is_an_error() {
     let (code, out) = herdr.run(&["agent", "list"]).expect("ran");
     assert_ne!(code, 0);
     assert!(out.contains("timed out"), "{out}");
+}
+
+/// The binary with `env` alone and `input` on stdin; its exit code, stdout
+/// and stderr.
+fn run(args: &[&str], env: &[(&str, &Path)], input: &str) -> (Option<i32>, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_herdr-matrix"))
+        .args(args)
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ran");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("ran");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn chats_prints_the_answer_of_the_gate() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let socket = dir.path().join("gate");
+    let listener = UnixListener::bind(&socket).expect("bind");
+    let gate = thread::spawn(move || {
+        let mut asked = Vec::new();
+        for reply in [
+            r#"{"ok": [{"room": "!r:x", "name": "Friend"}]}"#,
+            r#"{"error": "not a bridged chat"}"#,
+            "",
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).expect("read");
+            writeln!(stream, "{reply}").expect("write");
+            asked.push(line);
+        }
+        asked
+    });
+    let env = [("HERDR_MATRIX_GATE_SOCKET", socket.as_path())];
+    assert_eq!(
+        run(&["chats", "rooms"], &env, ""),
+        (
+            Some(0),
+            "[\n  {\n    \"room\": \"!r:x\",\n    \"name\": \"Friend\"\n  }\n]\n".to_owned(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        run(&["chats", "send", "!h:x", "hi", "--since"], &env, ""),
+        (Some(1), String::new(), "not a bridged chat\n".to_owned())
+    );
+    assert_eq!(
+        run(&["chats"], &env, ""),
+        (
+            Some(1),
+            String::new(),
+            "the gate gave no answer\n".to_owned()
+        )
+    );
+    assert_eq!(
+        gate.join().expect("the gate"),
+        [
+            "{\"argv\":[\"rooms\"]}\n",
+            "{\"argv\":[\"send\",\"!h:x\",\"hi\",\"--since\"]}\n",
+            "{\"argv\":[]}\n",
+        ]
+    );
+    let (code, out, err) = run(&["chats", "rooms"], &env, "");
+    assert_eq!((code, out.as_str()), (Some(1), ""));
+    assert!(err.starts_with("cannot reach the gate: "), "{err}");
+    assert_eq!(err.lines().count(), 1);
+}
+
+#[test]
+fn gate_answers_a_bad_request() {
+    let _serial = serial();
+    for (input, want) in [
+        (
+            r#"{"argv": ["delete", "!r"]}"#,
+            "unknown command; usage: herdr-matrix chats",
+        ),
+        ("delete !r", "the request is not {\"argv\": [...]}"),
+        (
+            r#"{"argv": ["rooms"]}"#,
+            "HERDR_MATRIX_GATE_HOMESERVER is not set",
+        ),
+    ] {
+        let (code, out, err) = run(&["gate"], &[], input);
+        assert_eq!(code, Some(0), "{input}: {err}");
+        let reply: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+        let error = reply["error"].as_str().expect("an error");
+        assert!(error.starts_with(want), "{input}: {error}");
+        assert_eq!(
+            (out.lines().count(), err.lines().count()),
+            (1, 1),
+            "{input}"
+        );
+    }
 }

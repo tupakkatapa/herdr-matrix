@@ -104,7 +104,7 @@ fn purge(dir: &Path, old: f64) -> Result<()> {
 }
 
 /// The user this process runs as.
-fn own_uid() -> Result<u32> {
+pub(crate) fn own_uid() -> Result<u32> {
     Ok(fs::metadata("/proc/self")?.uid())
 }
 

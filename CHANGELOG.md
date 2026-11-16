@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Silent turns: a turn whose last message is `NOOP` posts nothing, also as an away notice.
 - `herdr-matrix prompt <agent> <text>`: queues a prompt that the running bot hands to the agent; the last message of its turn posts in the agent's own chat, else in the main chat.
 - The option `spawnPrefix`: off, the user of an agent's own chat has the agent's name alone. The name follows the agent when it changes.
+- The chat gate: the NixOS module `services.herdr-matrix-gate` and `herdr-matrix chats rooms|read|search|send`, with which agents read, search and send in the owner's bridged chats. Only the gate, under its own system user, reads the owner's token; it refuses every room of the bot.
 
 ### Changed
 
