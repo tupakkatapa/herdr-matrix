@@ -12,13 +12,15 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::files::{private_dir, random_name};
 
-/// A prompt for the agent `agent` names; `at` is in seconds since the
-/// epoch.
+/// A prompt for the agent `agent` names, or with `cwd`, for the agent
+/// working there; `at` is in seconds since the epoch.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Prompt {
     pub agent: String,
     pub text: String,
     pub at: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Queues a prompt in `dir`, a private directory; the path of its file.
@@ -100,6 +102,7 @@ mod tests {
             agent: agent.into(),
             text: "Check the mail".into(),
             at,
+            cwd: None,
         }
     }
 

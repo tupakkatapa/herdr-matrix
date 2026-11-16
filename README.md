@@ -12,7 +12,8 @@ A Matrix chat with the Claude Code agents that [herdr](https://github.com/ogulca
 - **Files and voice**: pictures and files are handed to the agent; voice messages are transcribed by whisper.cpp and count as written
 - **Own chats**: `!dm <name>` gives an agent a direct chat of its own, as an appservice user named after the agent
 - **Silent turns**: a turn whose last message is `NOOP` posts nothing, so a routine check can stay quiet
-- **Prompts from the machine**: `herdr-matrix prompt` hands a prompt to an agent, for example from a timer, and its turn posts in the chat
+- **Prompts from the machine**: `herdr-matrix prompt` hands a prompt to an agent, for example on a schedule from `agents.<id>.prompts`, and its turn posts in the chat
+- **Settings per agent**: `agents.<id>` gives the own chat of the agent working in a directory its name, prefix and picture
 - **Chats for the agents**: `herdr-matrix chats` reads, searches and sends in your bridged chats (WhatsApp, Signal, Telegram), through a gate that alone holds your token
 
 ## Getting Started
@@ -82,9 +83,25 @@ A program on the same machine, such as a systemd timer, prompts an agent through
 
 ```sh
 herdr-matrix prompt <agent> <text>...
+herdr-matrix prompt --cwd <dir> <text>...
 ```
 
-The command queues the prompt and exits. It names the agent like `!attach`. The bot hands the text to the agent as written, without `[Element]`, and posts the last message of the turn in the agent's own chat, else in the main chat. An agent that works or waits on a choice does not get the prompt. The binary is not on `PATH` unless the [chat gate](#chats-for-the-agents) is enabled; use `${config.programs.herdr.matrix.package}/bin/herdr-matrix`.
+The command queues the prompt and exits. It names the agent like `!attach`, or by its working directory. The bot hands the text to the agent as written, without `[Element]`, and posts the last message of the turn in the agent's own chat, else in the main chat. An agent that works or waits on a choice does not get the prompt. The binary is not on `PATH` unless the [chat gate](#chats-for-the-agents) is enabled; use `${config.programs.herdr.matrix.package}/bin/herdr-matrix`.
+
+Settings per agent, each for the agent working in `cwd`. `name`, `prefix` and `avatar` set its own chat user (`!dm`); each `prompts.<name>` is a user service and timer `herdr-matrix-prompt-<id>-<name>`:
+
+```nix
+programs.herdr.matrix.agents.assistant = {
+  cwd = "${config.home.homeDirectory}/Workspace/assistant";
+  name = "Kate"; # default: the agent's name
+  prefix = false; # default: spawnPrefix
+  avatar = ./kate.png; # default: spawnAvatar
+  prompts.wake = {
+    text = "Check the mail. When nothing is new, answer NOOP only.";
+    onCalendar = "hourly";
+  };
+};
+```
 
 ## Chats for the agents
 

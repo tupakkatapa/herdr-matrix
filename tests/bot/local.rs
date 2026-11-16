@@ -13,6 +13,18 @@ fn local(t: &T, agent: &str, text: &str, at: f64) {
         agent: agent.into(),
         text: text.into(),
         at,
+        cwd: None,
+    };
+    queue(&t.inbox(), &prompt).expect("queued");
+}
+
+/// A prompt from the machine, queued as `herdr-matrix prompt --cwd` does.
+fn local_in(t: &T, dir: &str, text: &str, at: f64) {
+    let prompt = Prompt {
+        agent: String::new(),
+        text: text.into(),
+        at,
+        cwd: Some(dir.into()),
     };
     queue(&t.inbox(), &prompt).expect("queued");
 }
@@ -253,5 +265,66 @@ fn local_prompt_for_a_working_agent_is_dropped() {
     t.bot.local().expect("local");
     assert!(t.herdr.did("prompt").is_empty());
     assert_eq!(t.log_lines(), ["wA:p1 prompt dropped: it works"]);
+    assert!(t.bot.state().pending.is_empty());
+}
+
+#[test]
+fn local_prompt_by_cwd() {
+    let mut t = T::new();
+    t.set("wA:p1", "done");
+    t.set("wB:p1", "idle");
+    {
+        let cwd = &mut t.herdr.0.borrow_mut().cwd;
+        cwd.insert("wA:p1".into(), "/w/a".into());
+        cwd.insert("wB:p1".into(), "/w/b/".into());
+    }
+    t.poll();
+    t.clear_log();
+    let now = t.now();
+    local_in(&t, "/w/a/", "wake", now - 2.0);
+    local_in(&t, "/w/b", "wake", now - 1.0);
+    local_in(&t, "/w", "wake", now);
+    t.bot.local().expect("local");
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![
+            c(&["agent", "prompt", "wA:p1", "wake"]),
+            c(&["agent", "prompt", "wB:p1", "wake"]),
+        ]
+    );
+    assert_eq!(
+        t.log_lines(),
+        [
+            "wA:p1 local 4",
+            "wB:p1 local 4",
+            "prompt for \"/w\" dropped: it matches 0 agents",
+        ]
+    );
+}
+
+#[test]
+fn local_prompt_by_shared_cwd_is_dropped() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    {
+        let cwd = &mut t.herdr.0.borrow_mut().cwd;
+        cwd.insert("wA:p1".into(), "/w".into());
+        cwd.insert("wB:p1".into(), "/w/".into());
+    }
+    t.poll();
+    t.clear_log();
+    let now = t.now();
+    local_in(&t, "/w", "wake", now);
+    local_in(&t, "/w", "wake", now - 601.0);
+    t.bot.local().expect("local");
+    assert!(t.herdr.did("prompt").is_empty());
+    assert_eq!(
+        t.log_lines(),
+        [
+            "prompt for \"/w\" dropped: older than 10 minutes",
+            "prompt for \"/w\" dropped: it matches 2 agents",
+        ]
+    );
     assert!(t.bot.state().pending.is_empty());
 }

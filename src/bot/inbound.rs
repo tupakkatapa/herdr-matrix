@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs;
 use std::time::Duration;
 
-use super::{Bot, MARK, STALE, To};
+use super::{Bot, MARK, STALE, To, same_dir};
 use crate::commands::{KEY_HINT, KEYS, reaction, spoken};
 use crate::files;
 use crate::herdr::{self, Agent, Herdr, Status};
@@ -355,18 +355,14 @@ impl Bot {
     }
 
     fn local_prompt(&mut self, prompt: &Prompt, agents: &[Agent]) -> Result<()> {
-        let dropped = |why: String| format!("prompt for \"{}\" dropped: {why}", prompt.agent);
+        let to = prompt.cwd.as_deref().unwrap_or(&prompt.agent);
+        let dropped = |why: String| format!("prompt for \"{to}\" dropped: {why}");
         if self.now() - prompt.at > STALE.as_secs_f64() {
             let minutes = STALE.as_secs_f64() / 60.0;
             self.log(&dropped(format!("older than {minutes:.0} minutes")));
             return Ok(());
         }
-        let found = if prompt.agent.is_empty() {
-            Err(agents.len())
-        } else {
-            herdr::find(agents, &prompt.agent)
-        };
-        let a = match found {
+        let a = match addressee(prompt, agents) {
             Ok(a) => a,
             Err(n) => {
                 self.log(&dropped(format!("it matches {n} agents")));
@@ -507,6 +503,28 @@ impl Bot {
             }
             Err(err) => Err(err),
         }
+    }
+}
+
+/// The agent a prompt from the machine is for: the one its `cwd` names,
+/// a trailing `/` aside, else the one its `agent` names; else how many
+/// match.
+fn addressee<'a>(prompt: &Prompt, agents: &'a [Agent]) -> std::result::Result<&'a Agent, usize> {
+    let Some(dir) = prompt.cwd.as_deref() else {
+        return if prompt.agent.is_empty() {
+            Err(agents.len())
+        } else {
+            herdr::find(agents, &prompt.agent)
+        };
+    };
+    let matches: Vec<&Agent> = agents
+        .iter()
+        .filter(|a| a.cwd.as_deref().is_some_and(|cwd| same_dir(cwd, dir)))
+        .collect();
+    if let [a] = matches[..] {
+        Ok(a)
+    } else {
+        Err(matches.len())
     }
 }
 

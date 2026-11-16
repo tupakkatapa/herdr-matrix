@@ -3,16 +3,17 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use regex::Regex;
 
-use super::{Bot, To};
+use super::{AgentSettings, Bot, To, same_dir};
 use crate::commands::contact;
 use crate::herdr::Agent;
 use crate::matrix::{Api as _, As};
-use crate::state::Chat;
+use crate::state::{Chat, sha256_hex};
 use crate::{Error, Result};
 
 /// Why an agent's own chat ends: the owner asked, or the agent is gone.
@@ -35,8 +36,8 @@ impl Bot {
             return Ok(());
         }
         let user = self.contact_user(&a.name)?;
-        let display = self.contact_name(&a.name);
-        self.register(&user, &display)?;
+        let display = self.contact_name(a);
+        let avatar = self.register(&user, &display, self.contact_avatar(a))?;
         let since = self
             .matrix
             .sync(None, As::User(&user), Duration::ZERO)?
@@ -47,6 +48,7 @@ impl Bot {
             room,
             since: Some(since),
             name: Some(display),
+            avatar,
             ..Chat::default()
         };
         self.state.spawned.insert(a.pane_id.clone(), chat.clone());
@@ -62,31 +64,88 @@ impl Bot {
         Ok(())
     }
 
+    /// The settings of the agent working in the directory of `a`.
+    fn agent_settings(&self, a: &Agent) -> Option<&AgentSettings> {
+        let cwd = a.cwd.as_deref()?;
+        self.deps.agents.iter().find(|s| same_dir(&s.cwd, cwd))
+    }
+
     /// The display name of an agent's contact: the bot's name and the
     /// agent's, or the agent's alone.
-    fn contact_name(&self, agent: &str) -> String {
+    fn contact_name(&self, a: &Agent) -> String {
+        let settings = self.agent_settings(a);
+        let agent = settings.and_then(|s| s.name.as_deref()).unwrap_or(&a.name);
+        let prefix = settings
+            .and_then(|s| s.prefix)
+            .unwrap_or(self.deps.spawn_prefix);
         match &self.deps.name {
-            Some(name) if self.deps.spawn_prefix => format!("{name} · {agent}"),
+            Some(name) if prefix => format!("{name} · {agent}"),
             _ => agent.to_owned(),
         }
     }
 
-    /// Gives each contact the name its agent has now; one that fails is
-    /// tried again at the next poll.
+    /// The picture of an agent's contact, if any.
+    fn contact_avatar(&self, a: &Agent) -> Option<PathBuf> {
+        self.agent_settings(a)
+            .and_then(|s| s.avatar.clone())
+            .or_else(|| self.deps.spawn_avatar.clone())
+            .filter(|p| !p.as_os_str().is_empty())
+    }
+
+    /// Gives each contact the name and picture its agent has now; one that
+    /// fails is tried again at the next poll.
     pub(super) fn rename_contacts(&mut self, agents: &[Agent]) {
         for a in agents {
             let Some(chat) = self.state.spawned.get(&a.pane_id) else {
                 continue;
             };
-            let name = self.contact_name(&a.name);
-            if chat.name.as_deref() == Some(name.as_str()) {
-                continue;
-            }
             let user = chat.user.clone();
-            if let Err(err) = self.rename(&a.pane_id, &user, name) {
+            let name = self.contact_name(a);
+            if chat.name.as_deref() != Some(name.as_str())
+                && let Err(err) = self.rename(&a.pane_id, &user, name)
+            {
                 self.log(&format!("error: rename {user}: {err}"));
             }
+            if let Err(err) = self.repaint(a, &user) {
+                self.log(&format!("error: picture {user}: {err}"));
+            }
         }
+    }
+
+    /// Sets the picture of an agent's contact when it differs from the one
+    /// last set; each picture is read once per run.
+    fn repaint(&mut self, a: &Agent, user: &str) -> Result<()> {
+        let Some(path) = self.contact_avatar(a) else {
+            return Ok(());
+        };
+        let want = if let Some(digest) = self.digests.get(&path) {
+            digest.clone()
+        } else {
+            let digest = sha256_hex(&fs::read(&path)?);
+            self.digests.insert(path.clone(), digest.clone());
+            digest
+        };
+        let Some(chat) = self.state.spawned.get(&a.pane_id) else {
+            return Ok(());
+        };
+        if chat.avatar.as_deref() == Some(want.as_str()) {
+            return Ok(());
+        }
+        let digest = self.set_picture(user, &path)?;
+        if let Some(chat) = self.state.spawned.get_mut(&a.pane_id) {
+            chat.avatar = Some(digest);
+        }
+        self.save()
+    }
+
+    /// Sets a contact's picture; its sha256.
+    fn set_picture(&mut self, user: &str, path: &Path) -> Result<String> {
+        let data = fs::read(path)?;
+        let digest = sha256_hex(&data);
+        self.digests.insert(path.to_owned(), digest.clone());
+        let url = self.picture(&data)?;
+        self.matrix.set_avatar(user, As::User(user), &url)?;
+        Ok(digest)
     }
 
     fn rename(&mut self, pane: &str, user: &str, name: String) -> Result<()> {
@@ -131,22 +190,19 @@ impl Bot {
         Ok(user)
     }
 
-    /// Registers a user of the appservice, once, with its name and picture.
-    fn register(&mut self, user: &str, display: &str) -> Result<()> {
+    /// Registers a user of the appservice, once, with its name and picture;
+    /// the sha256 of the picture.
+    fn register(
+        &mut self,
+        user: &str,
+        display: &str,
+        avatar: Option<PathBuf>,
+    ) -> Result<Option<String>> {
         let username = user[1..].split(':').next().unwrap_or_default();
         self.matrix.register(username)?;
         self.matrix
             .set_displayname(user, As::User(user), Some(display))?;
-        if let Some(avatar) = self
-            .deps
-            .spawn_avatar
-            .clone()
-            .filter(|p| !p.as_os_str().is_empty())
-        {
-            let url = self.picture(&fs::read(avatar)?)?;
-            self.matrix.set_avatar(user, As::User(user), &url)?;
-        }
-        Ok(())
+        avatar.map(|path| self.set_picture(user, &path)).transpose()
     }
 
     /// Ends an agent's own chat; the agent keeps running.

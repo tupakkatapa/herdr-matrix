@@ -22,6 +22,70 @@ let
       };
     };
   };
+  prompt = lib.types.submodule {
+    options = {
+      text = lib.mkOption {
+        type = lib.types.str;
+        example = "wake";
+        description = "The prompt.";
+      };
+      onCalendar = lib.mkOption {
+        type = lib.types.str;
+        example = "hourly";
+        description = "When to send it, as a systemd calendar expression (`man systemd.time`).";
+      };
+    };
+  };
+  agent = lib.types.submodule {
+    options = {
+      cwd = lib.mkOption {
+        type = lib.types.str;
+        example = "/home/alice/Workspace/assistant";
+        description = "The working directory of the agent; a trailing `/` aside, it must equal the agent's. It takes no systemd specifier such as `%h`.";
+      };
+      name = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "Kate";
+        description = "The name of the agent's own chat user, in place of the agent's name. The agent keeps its herdr name for `!attach`, `!agents` and `herdr-matrix prompt`.";
+      };
+      prefix = lib.mkOption {
+        type = lib.types.nullOr lib.types.bool;
+        default = null;
+        description = "Put {option}`displayName` before the name of the agent's own chat user. Unset, {option}`spawnPrefix` decides.";
+      };
+      avatar = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = "The picture of the agent's own chat user, a PNG. Unset, it is {option}`spawnAvatar`.";
+      };
+      prompts = lib.mkOption {
+        type = lib.types.attrsOf prompt;
+        default = { };
+        example = { wake = { text = "wake"; onCalendar = "hourly"; }; };
+        description = ''
+          Prompts the agent gets on a schedule. Each one is a user service and timer `herdr-matrix-prompt-<id>-<name>`.
+          The bot drops a prompt when no agent or more than one works in {option}`cwd`, when the agent works or waits on a choice, or when the bot is down for 10 minutes; `journalctl --user -u herdr-matrix` says why.
+        '';
+      };
+    };
+  };
+  agentsFile = pkgs.writeText "herdr-matrix-agents.json" (builtins.toJSON (lib.mapAttrsToList
+    (_: a: {
+      inherit (a) cwd name prefix;
+      avatar = if a.avatar == null then null else "${a.avatar}";
+    })
+    cfg.matrix.agents));
+  prompts = lib.concatLists (lib.mapAttrsToList
+    (id: a: lib.mapAttrsToList
+      (name: p: {
+        name = "herdr-matrix-prompt-${id}-${name}";
+        description = "herdr-matrix prompt ${id}-${name}";
+        args = [ (lib.getExe cfg.matrix.package) "prompt" "--cwd" a.cwd p.text ];
+        inherit (p) onCalendar;
+      })
+      a.prompts)
+    cfg.matrix.agents);
   models = "${stateDir}/models";
   transcribes = cfg.matrix.transcribe.model != null;
   # One `Environment=` entry, quoted, with `%` kept from specifier expansion
@@ -105,10 +169,26 @@ in
         example = "en";
         description = "The language of the voice messages, as `whisper-cli -l` takes it; `auto` detects it.";
       };
+      agents = lib.mkOption {
+        type = lib.types.attrsOf agent;
+        default = { };
+        example = lib.literalExpression ''
+          {
+            assistant = {
+              cwd = "''${config.home.homeDirectory}/Workspace/assistant";
+              name = "Kate";
+              prefix = false;
+              avatar = ./kate.png;
+              prompts.wake = { text = "wake"; onCalendar = "hourly"; };
+            };
+          }
+        '';
+        description = "Settings per agent, each for the agent working in its {option}`cwd`. The attribute name is used in unit names only.";
+      };
     };
   };
 
-  config = lib.mkIf cfg.matrix.enable {
+  config = lib.mkIf cfg.matrix.enable (lib.mkMerge [{
     assertions = [{
       assertion = cfg.enable;
       message = "programs.herdr.matrix.enable needs programs.herdr.enable.";
@@ -136,6 +216,9 @@ in
         // lib.optionalAttrs transcribes {
           HERDR_MATRIX_WHISPER_MODEL = modelPath cfg.matrix.transcribe.model;
           HERDR_MATRIX_WHISPER_LANGUAGE = cfg.matrix.transcribe.language;
+        }
+        // lib.optionalAttrs (cfg.matrix.agents != { }) {
+          HERDR_MATRIX_AGENTS = "${agentsFile}";
         });
         Restart = "on-failure";
         RestartSec = 10;
@@ -150,5 +233,26 @@ in
         ExecStart = lib.getExe fetchModels;
       };
     };
-  };
+  }
+    {
+      systemd.user.services = lib.listToAttrs (map
+        (p: lib.nameValuePair p.name {
+          Unit = {
+            Description = p.description;
+            After = [ "herdr.service" "herdr-matrix.service" ];
+          };
+          Service = {
+            Type = "oneshot";
+            ExecStart = "${pkgs.writeShellScript p.name "exec ${lib.escapeShellArgs p.args}"}";
+          };
+        })
+        prompts);
+      systemd.user.timers = lib.listToAttrs (map
+        (p: lib.nameValuePair p.name {
+          Unit.Description = p.description;
+          Timer.OnCalendar = p.onCalendar;
+          Install.WantedBy = [ "timers.target" ];
+        })
+        prompts);
+    }]);
 }

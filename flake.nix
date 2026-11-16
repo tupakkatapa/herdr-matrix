@@ -95,6 +95,10 @@
                     type = lib.types.attrsOf lib.types.anything;
                     default = { };
                   };
+                  systemd.user.timers = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.anything;
+                    default = { };
+                  };
                   assertions = lib.mkOption {
                     type = lib.types.listOf lib.types.anything;
                     default = [ ];
@@ -125,7 +129,29 @@
                   };
                 };
               };
+              # Prints the arguments the prompt units call it with, one per line
+              echo = pkgs.writeShellScriptBin "herdr-matrix" ''printf '%s\n' "$@"'';
+              agents = eval {
+                programs.herdr = {
+                  enable = true;
+                  matrix = matrix // {
+                    package = echo;
+                    agents = {
+                      kate = {
+                        cwd = "/w/a b";
+                        name = "Kate";
+                        prefix = false;
+                        avatar = "/k.png";
+                        prompts.wake = { text = "it's 100% $HOME \"q\""; onCalendar = "hourly"; };
+                        prompts.mail = { text = "mail"; onCalendar = "*:0/15"; };
+                      };
+                      quiet.cwd = "/w/q";
+                    };
+                  };
+                };
+              };
               service = config: config.systemd.user.services.herdr-matrix;
+              agentsFile = config: lib.findFirst (lib.hasPrefix "\"HERDR_MATRIX_AGENTS=") null (service config).Service.Environment;
               path = config: lib.findFirst (lib.hasPrefix "\"PATH=") "" (service config).Service.Environment;
               pass = name: assertion: assert assertion; pkgs.runCommand name { } "touch $out";
             in
@@ -162,6 +188,42 @@
                 && lib.hasInfix "whisper-cpp" (path hears)
                 && lib.hasInfix "ffmpeg" (path hears)
               );
+              # Per-agent settings: none, no file and no prompt units; else the
+              # file, and a service and timer per prompt that pass its text whole
+              module-agents =
+                let
+                  units = agents.systemd.user.services;
+                  timers = agents.systemd.user.timers;
+                  names = [ "herdr-matrix-prompt-kate-mail" "herdr-matrix-prompt-kate-wake" ];
+                  file = lib.removeSuffix "\"" (lib.removePrefix "\"HERDR_MATRIX_AGENTS=" (agentsFile agents));
+                  wake = pkgs.writeText "wake" "prompt\n--cwd\n/w/a b\nit's 100% $HOME \"q\"\n";
+                in
+                assert agentsFile bare == null
+                && lib.attrNames bare.systemd.user.services == [ "herdr-matrix" ]
+                && bare.systemd.user.timers == { }
+                && lib.attrNames units == [ "herdr-matrix" ] ++ names
+                && lib.attrNames timers == names
+                && units.herdr-matrix-prompt-kate-wake.Unit == {
+                  Description = "herdr-matrix prompt kate-wake";
+                  After = [ "herdr.service" "herdr-matrix.service" ];
+                }
+                && units.herdr-matrix-prompt-kate-wake.Service.Type == "oneshot"
+                && timers.herdr-matrix-prompt-kate-wake == {
+                  Unit.Description = "herdr-matrix prompt kate-wake";
+                  Timer.OnCalendar = "hourly";
+                  Install.WantedBy = [ "timers.target" ];
+                }
+                && timers.herdr-matrix-prompt-kate-mail.Timer.OnCalendar == "*:0/15";
+                pkgs.runCommand "herdr-matrix-module-agents" { nativeBuildInputs = [ pkgs.jq ]; } ''
+                  ${units.herdr-matrix-prompt-kate-wake.Service.ExecStart} > wake
+                  diff wake ${wake}
+                  test "$(${units.herdr-matrix-prompt-kate-mail.Service.ExecStart})" = "$(printf '%s\n' prompt --cwd '/w/a b' mail)"
+                  jq -e '. == [
+                    {"cwd": "/w/a b", "name": "Kate", "prefix": false, "avatar": "/k.png"},
+                    {"cwd": "/w/q", "name": null, "prefix": null, "avatar": null}
+                  ]' ${file}
+                  touch $out
+                '';
               module-assertion = pass "herdr-matrix-module-assertion" (
                 lib.elem
                   {

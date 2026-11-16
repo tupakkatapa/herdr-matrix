@@ -107,6 +107,9 @@ pub struct Chat {
     /// The contact's display name last set
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The sha256 of the contact's picture last set
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

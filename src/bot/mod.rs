@@ -8,12 +8,13 @@ mod inbound;
 mod onboard;
 mod poll;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::herdr::{self, Agent, Herdr, RunHerdr, Status, Turn, claude_turn};
@@ -48,6 +49,18 @@ pub const PENDING_TTL: Duration = Duration::from_mins(10);
 pub type Transcribe = Box<dyn Fn(&Path) -> Result<String>>;
 pub type Answer = Box<dyn Fn(&Agent) -> Option<Turn>>;
 
+/// How the own chat of the agent working in `cwd` looks; each unset part
+/// is as for any agent.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct AgentSettings {
+    pub cwd: String,
+    pub name: Option<String>,
+    /// The bot's name before the agent's, in place of `spawn_prefix`
+    pub prefix: Option<bool>,
+    pub avatar: Option<PathBuf>,
+}
+
 /// What the bot works with; the tests swap each part.
 pub struct Deps {
     /// The only user the bot listens to
@@ -72,6 +85,7 @@ pub struct Deps {
     pub spawn_prefix: bool,
     /// Where `herdr-matrix prompt` queues prompts from the machine
     pub inbox: Option<PathBuf>,
+    pub agents: Vec<AgentSettings>,
 }
 
 impl Default for Deps {
@@ -95,6 +109,7 @@ impl Default for Deps {
             spawn_avatar: None,
             spawn_prefix: true,
             inbox: None,
+            agents: Vec::new(),
         }
     }
 }
@@ -216,6 +231,8 @@ pub struct Bot {
     profiled: bool,
     /// Transaction ids of messages not yet out whole, by what they send
     txns: IndexMap<String, String>,
+    /// The sha256 of each contact picture read in this run, by its path
+    digests: HashMap<PathBuf, String>,
 }
 
 impl Bot {
@@ -236,6 +253,7 @@ impl Bot {
             user_id: None,
             profiled: false,
             txns: IndexMap::new(),
+            digests: HashMap::new(),
         }
     }
 
@@ -522,6 +540,11 @@ impl Bot {
     fn turn(&self, a: &Agent) -> Turn {
         (self.deps.answer)(a).unwrap_or_default()
     }
+}
+
+/// True when two directories are one, a trailing `/` aside.
+fn same_dir(a: &str, b: &str) -> bool {
+    a.strip_suffix('/').unwrap_or(a) == b.strip_suffix('/').unwrap_or(b)
 }
 
 /// True for a message that says the turn has nothing to post.

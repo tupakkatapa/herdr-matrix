@@ -2,10 +2,11 @@
 //! loop that outlives failures.
 
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::bot::{Bot, Deps};
+use crate::bot::{AgentSettings, Bot, Deps};
 use crate::inbox::{self, Prompt};
 use crate::matrix::Http;
 use crate::state::Store;
@@ -31,6 +32,7 @@ pub struct Settings {
     pub spawn_prefix: bool,
     /// The whisper.cpp model and the language it hears
     pub whisper: Option<(String, String)>,
+    pub agents: Vec<AgentSettings>,
 }
 
 impl fmt::Debug for Settings {
@@ -46,6 +48,7 @@ impl fmt::Debug for Settings {
             .field("spawn_avatar", &self.spawn_avatar)
             .field("spawn_prefix", &self.spawn_prefix)
             .field("whisper", &self.whisper)
+            .field("agents", &self.agents)
             .finish()
     }
 }
@@ -101,6 +104,13 @@ pub fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<Settings> {
             )));
         }
     };
+    let agents = match env("HERDR_MATRIX_AGENTS") {
+        None => Vec::new(),
+        Some(path) => fs::read(&path)
+            .map_err(|err| err.to_string())
+            .and_then(|data| serde_json::from_slice(&data).map_err(|err| err.to_string()))
+            .map_err(|err| Error::Setting(format!("HERDR_MATRIX_AGENTS {path}: {err}")))?,
+    };
     Ok(Settings {
         homeserver,
         token: need("HERDR_MATRIX_TOKEN")?,
@@ -117,6 +127,7 @@ pub fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<Settings> {
                 env("HERDR_MATRIX_WHISPER_LANGUAGE").unwrap_or_else(|| "auto".into()),
             )
         }),
+        agents,
     })
 }
 
@@ -136,6 +147,7 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Bot> {
         avatar: s.avatar,
         spawn_avatar: s.spawn_avatar,
         spawn_prefix: s.spawn_prefix,
+        agents: s.agents,
         ..Deps::default()
     };
     if let Some((model, language)) = s.whisper {
@@ -158,18 +170,27 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Bot> {
     ))
 }
 
+/// The agent a prompt is for: the one a name or pane id names, or the
+/// one working in a directory.
+#[derive(Clone, Copy, Debug)]
+pub enum Target<'a> {
+    Agent(&'a str),
+    Cwd(&'a str),
+}
+
 /// Queues a prompt for the running bot, which hands it to the agent
-/// `agent` names; the path of its file.
+/// `target` names; the path of its file.
 ///
 /// # Errors
-/// When the agent or the text is empty, when neither `XDG_RUNTIME_DIR` nor
+/// When the target or the text is empty, when neither `XDG_RUNTIME_DIR` nor
 /// `HERDR_MATRIX_STATE` is set, or when the file cannot be written.
 pub fn queue_prompt(
     env: &dyn Fn(&str) -> Option<String>,
-    agent: &str,
+    target: Target,
     text: &str,
 ) -> Result<PathBuf> {
-    if agent.is_empty() || text.is_empty() {
+    let (Target::Agent(named) | Target::Cwd(named)) = target;
+    if named.is_empty() || text.is_empty() {
         return Err(Error::Setting(
             "the agent and the text must not be empty".into(),
         ));
@@ -183,9 +204,16 @@ pub fn queue_prompt(
     inbox::queue(
         &files.join("prompts"),
         &Prompt {
-            agent: agent.to_owned(),
+            agent: match target {
+                Target::Agent(agent) => agent.to_owned(),
+                Target::Cwd(_) => String::new(),
+            },
             text: text.to_owned(),
             at,
+            cwd: match target {
+                Target::Agent(_) => None,
+                Target::Cwd(dir) => Some(dir.to_owned()),
+            },
         },
     )
 }
@@ -327,6 +355,59 @@ mod tests {
     }
 
     #[test]
+    fn agent_settings_come_from_a_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("agents.json");
+        fs::write(
+            &file,
+            r#"[{"cwd": "/w/a", "name": "Kate", "prefix": false, "avatar": "/k.png"},
+                {"cwd": "/w/b", "name": null, "prefix": null, "avatar": null}]"#,
+        )
+        .expect("write");
+        let env = env(
+            dir.path(),
+            &[("HERDR_MATRIX_AGENTS", file.display().to_string())],
+        );
+        let bot = from_env(&|k| env.get(k).cloned()).expect("bot");
+        assert_eq!(
+            bot.deps().agents,
+            [
+                AgentSettings {
+                    cwd: "/w/a".into(),
+                    name: Some("Kate".into()),
+                    prefix: Some(false),
+                    avatar: Some("/k.png".into()),
+                },
+                AgentSettings {
+                    cwd: "/w/b".into(),
+                    ..AgentSettings::default()
+                },
+            ]
+        );
+        let env = self::env(dir.path(), &[]);
+        assert!(
+            settings(&|k| env.get(k).cloned())
+                .expect("settings")
+                .agents
+                .is_empty()
+        );
+        fs::write(&file, "[{").expect("write");
+        for path in [file.clone(), dir.path().join("missing.json")] {
+            let env = self::env(
+                dir.path(),
+                &[("HERDR_MATRIX_AGENTS", path.display().to_string())],
+            );
+            let err = settings(&|k| env.get(k).cloned()).expect_err("refused");
+            assert!(matches!(err, Error::Setting(_)), "{err}");
+            assert!(
+                err.to_string()
+                    .starts_with(&format!("HERDR_MATRIX_AGENTS {}: ", path.display())),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
     fn prompt_is_queued_where_the_bot_takes_it() {
         let dir = TempDir::new();
         let run = dir.path().join("run");
@@ -341,7 +422,8 @@ mod tests {
             ),
         ] {
             let env: HashMap<&str, String> = env.into_iter().collect();
-            let path = queue_prompt(&|k| env.get(k).cloned(), "mail", "Check it").expect("queued");
+            let path = queue_prompt(&|k| env.get(k).cloned(), Target::Agent("mail"), "Check it")
+                .expect("queued");
             assert_eq!(path.parent(), Some(inbox.as_path()));
             let taken = crate::inbox::take(&inbox, &|_| {}).expect("take");
             assert_eq!(
@@ -353,11 +435,16 @@ mod tests {
             );
             assert!(taken[0].at > 1_700_000_000.0);
         }
-        let err = queue_prompt(&|_| None, "mail", "Check it").expect_err("nowhere");
+        let err = queue_prompt(&|_| None, Target::Agent("mail"), "Check it").expect_err("nowhere");
         assert!(matches!(err, Error::Setting(_)), "{err}");
         let env = HashMap::from([("XDG_RUNTIME_DIR", run.display().to_string())]);
-        for (agent, text) in [("", "Check it"), ("mail", "")] {
-            let err = queue_prompt(&|k| env.get(k).cloned(), agent, text).expect_err("empty");
+        for (target, text) in [
+            (Target::Agent(""), "Check it"),
+            (Target::Agent("mail"), ""),
+            (Target::Cwd(""), "Check it"),
+            (Target::Cwd("/w"), ""),
+        ] {
+            let err = queue_prompt(&|k| env.get(k).cloned(), target, text).expect_err("empty");
             assert!(matches!(err, Error::Setting(_)), "{err}");
         }
     }

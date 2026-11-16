@@ -179,6 +179,36 @@ fn prompt_command_queues() {
 }
 
 #[test]
+fn prompt_command_queues_by_cwd() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let inbox = dir.path().join("herdr-matrix/prompts");
+    let (code, err) = herdr_matrix(dir.path(), &["prompt", "--cwd", "/w/a b", "wake", "up"]);
+    assert_eq!(code, Some(0), "{err}");
+    let (code, err) = herdr_matrix(dir.path(), &["prompt", "mail", "hi"]);
+    assert_eq!(code, Some(0), "{err}");
+    let (by_name, by_cwd): (Vec<serde_json::Value>, Vec<serde_json::Value>) = fs::read_dir(&inbox)
+        .expect("a prompt directory")
+        .map(|e| fs::read(e.expect("entry").path()).expect("read"))
+        .map(|data| serde_json::from_slice::<serde_json::Value>(&data).expect("JSON"))
+        .partition(|p| p["agent"] == "mail");
+    assert_eq!((by_name.len(), by_cwd.len()), (1, 1));
+    assert_eq!(
+        (&by_cwd[0]["cwd"], &by_cwd[0]["agent"], &by_cwd[0]["text"]),
+        (&"/w/a b".into(), &"".into(), &"wake up".into())
+    );
+    assert!(by_name[0].get("cwd").is_none(), "{}", by_name[0]);
+    for args in [&["prompt", "--cwd"][..], &["prompt", "--cwd", "/w"]] {
+        let (code, err) = herdr_matrix(dir.path(), args);
+        assert_eq!(code, Some(2), "{args:?}");
+        assert!(err.starts_with("usage: herdr-matrix"), "{args:?}: {err}");
+    }
+    let (code, err) = herdr_matrix(dir.path(), &["prompt", "--cwd", "", "hi"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(fs::read_dir(&inbox).expect("list").count(), 2);
+}
+
+#[test]
 fn herdr_timeout_is_an_error() {
     let _serial = serial();
     let dir = TempDir::new();

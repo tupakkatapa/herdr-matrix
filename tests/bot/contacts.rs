@@ -1,7 +1,12 @@
 //! Agents with a chat of their own, as contacts.
 
+use std::fs;
+use std::path::PathBuf;
+
 use crate::fakes::{OWNER, PERMISSION, T, c, fruit, ms, reply_to};
+use herdr_matrix::bot::AgentSettings;
 use herdr_matrix::matrix::quote;
+use herdr_matrix::state::sha256_hex;
 use serde_json::json;
 
 #[test]
@@ -766,4 +771,150 @@ fn contact_name_without_prefix() {
     t.poll();
     assert_eq!(names(&t, &a.user), ["Claude · repo-wA", "repo-wA"]);
     assert_eq!(names(&t, &b.user), ["repo-wB"]);
+}
+
+/// The `/avatar_url` calls of a contact.
+fn pictures(t: &T, user: &str) -> usize {
+    t.matrix
+        .as_user(user)
+        .into_iter()
+        .filter(|c| c.0 == "PUT" && c.1.ends_with("/avatar_url"))
+        .count()
+}
+
+/// Settings for the agent working in `/w/a`, which `wA:p1` is; the path of
+/// its picture, which holds `data`.
+fn configure(t: &mut T, name: Option<&str>, prefix: Option<bool>, data: &[u8]) -> PathBuf {
+    t.herdr
+        .0
+        .borrow_mut()
+        .cwd
+        .insert("wA:p1".into(), "/w/a/".into());
+    let avatar = t.dir.path().join("kate.png");
+    fs::write(&avatar, data).expect("write");
+    t.bot.deps_mut().agents = vec![AgentSettings {
+        cwd: "/w/a".into(),
+        name: name.map(Into::into),
+        prefix,
+        avatar: Some(avatar.clone()),
+    }];
+    avatar
+}
+
+#[test]
+fn configured_contact_has_its_own_name_and_picture() {
+    let mut t = T::new();
+    t.picture(b"blue");
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.bot.deps_mut().name = Some("Claude".into());
+    configure(&mut t, Some("Kate"), Some(false), b"kate");
+    let a = t.spawn("wA:p1", "repo-wA");
+    let b = t.spawn("wB:p1", "repo-wB");
+    assert_eq!(names(&t, &a.user), ["Kate"]);
+    assert_eq!(names(&t, &b.user), ["Claude · repo-wB"]);
+    assert_eq!(
+        t.matrix.0.borrow().uploads,
+        vec![b"kate".to_vec(), b"blue".to_vec()]
+    );
+    assert_eq!((pictures(&t, &a.user), pictures(&t, &b.user)), (1, 1));
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wA".into(), "mail".into());
+    t.poll();
+    t.poll();
+    t.poll();
+    assert_eq!(names(&t, &a.user), ["Kate"]);
+    assert_eq!(names(&t, &b.user), ["Claude · repo-wB"]);
+    assert_eq!((pictures(&t, &a.user), pictures(&t, &b.user)), (1, 1));
+    t.tell("!agents");
+    assert!(t.last_msg().contains("mail"), "{}", t.last_msg());
+}
+
+#[test]
+fn configured_prefix_without_the_global_one() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.bot.deps_mut().spawn_prefix = false;
+    configure(&mut t, None, Some(true), b"kate");
+    let a = t.spawn("wA:p1", "repo-wA");
+    assert_eq!(names(&t, &a.user), ["Claude · repo-wA"]);
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wA".into(), "mail".into());
+    t.poll();
+    t.poll();
+    assert_eq!(names(&t, &a.user), ["Claude · repo-wA", "Claude · mail"]);
+}
+
+#[test]
+fn contact_is_brought_in_line_with_new_settings() {
+    let mut t = T::new();
+    t.picture(b"blue");
+    t.set("wA:p1", "idle");
+    t.bot.deps_mut().name = Some("Claude".into());
+    let a = t.spawn("wA:p1", "repo-wA");
+    t.poll();
+    t.poll();
+    assert_eq!(pictures(&t, &a.user), 1);
+    t.bot = t.make();
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.picture(b"blue");
+    let avatar = configure(&mut t, Some("Kate"), None, b"kate");
+    fs::remove_file(&avatar).expect("remove");
+    t.clear_log();
+    t.poll();
+    t.poll();
+    assert_eq!(names(&t, &a.user), ["Claude · repo-wA", "Claude · Kate"]);
+    let lines = t.log_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with(&format!("error: picture {}: ", a.user)),
+        "{lines:?}"
+    );
+    assert_eq!(pictures(&t, &a.user), 1);
+    fs::write(&avatar, b"kate").expect("write");
+    t.poll();
+    t.poll();
+    assert_eq!(names(&t, &a.user), ["Claude · repo-wA", "Claude · Kate"]);
+    assert_eq!(pictures(&t, &a.user), 2);
+    assert_eq!(
+        t.matrix.0.borrow().uploads,
+        vec![b"blue".to_vec(), b"kate".to_vec()]
+    );
+    let now = &t.bot.state().spawned["wA:p1"];
+    assert_eq!(
+        (now.user.as_str(), now.room.as_str(), now.name.as_deref()),
+        (a.user.as_str(), a.room.as_str(), Some("Claude · Kate"))
+    );
+    assert_eq!(now.avatar, Some(sha256_hex(b"kate")));
+}
+
+#[test]
+fn contact_from_an_older_state_gets_its_picture_once() {
+    let mut t = T::new();
+    t.picture(b"blue");
+    t.set("wA:p1", "idle");
+    let a = t.spawn("wA:p1", "repo-wA");
+    t.poll();
+    t.poll();
+    t.bot
+        .state_mut()
+        .spawned
+        .get_mut("wA:p1")
+        .expect("a chat")
+        .avatar = None;
+    t.poll();
+    t.poll();
+    assert_eq!(pictures(&t, &a.user), 2);
+    assert_eq!(t.matrix.0.borrow().uploads, vec![b"blue".to_vec()]);
+    assert_eq!(
+        t.bot.state().spawned["wA:p1"].avatar,
+        Some(sha256_hex(b"blue"))
+    );
 }

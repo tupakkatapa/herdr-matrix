@@ -1,10 +1,11 @@
 use std::process::ExitCode;
 
-use herdr_matrix::app::{from_env, queue_prompt, serve};
+use herdr_matrix::app::{Target, from_env, queue_prompt, serve};
 use herdr_matrix::{chats, gate};
 
 const USAGE: &str = "usage: herdr-matrix
        herdr-matrix prompt <agent> <text>...
+       herdr-matrix prompt --cwd <dir> <text>...
        herdr-matrix chats <rooms|read|search|send> ...
        herdr-matrix gate";
 
@@ -13,8 +14,16 @@ fn main() -> anyhow::Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => {}
-        [command, agent, text @ ..] if command == "prompt" && !text.is_empty() => {
-            queue_prompt(&env, agent, &text.join(" "))?;
+        [command, flag, dir, text @ ..]
+            if command == "prompt" && flag == "--cwd" && !text.is_empty() =>
+        {
+            queue_prompt(&env, Target::Cwd(dir), &text.join(" "))?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        [command, agent, text @ ..]
+            if command == "prompt" && agent != "--cwd" && !text.is_empty() =>
+        {
+            queue_prompt(&env, Target::Agent(agent), &text.join(" "))?;
             return Ok(ExitCode::SUCCESS);
         }
         [command, request @ ..] if command == "chats" => {

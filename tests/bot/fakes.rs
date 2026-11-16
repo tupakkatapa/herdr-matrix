@@ -550,6 +550,7 @@ impl T {
                 spawn_avatar: None,
                 spawn_prefix: true,
                 inbox: Some(self.inbox()),
+                agents: Vec::new(),
             },
         )
     }
