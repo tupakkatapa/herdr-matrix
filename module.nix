@@ -82,6 +82,11 @@ in
         defaultText = lib.literalExpression "config.programs.herdr.matrix.avatar";
         description = "The picture of the user that speaks in an agent's own chat (`!dm`), a PNG.";
       };
+      spawnPrefix = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Put {option}`displayName` before the agent's name in the name of an agent's own chat user, as `herdr · repo`. Off, the name is the agent's alone. The name follows the agent when it changes.";
+      };
       transcribe.model = lib.mkOption {
         type = lib.types.nullOr download;
         default = null;
@@ -126,6 +131,7 @@ in
           HERDR_MATRIX_NAME = cfg.matrix.displayName;
           HERDR_MATRIX_AVATAR = "${cfg.matrix.avatar}";
           HERDR_MATRIX_SPAWN_AVATAR = "${cfg.matrix.spawnAvatar}";
+          HERDR_MATRIX_SPAWN_PREFIX = lib.boolToString cfg.matrix.spawnPrefix;
         }
         // lib.optionalAttrs transcribes {
           HERDR_MATRIX_WHISPER_MODEL = modelPath cfg.matrix.transcribe.model;

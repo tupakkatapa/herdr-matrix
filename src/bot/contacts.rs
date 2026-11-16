@@ -35,11 +35,7 @@ impl Bot {
             return Ok(());
         }
         let user = self.contact_user(&a.name)?;
-        let display = self
-            .deps
-            .name
-            .as_ref()
-            .map_or_else(|| a.name.clone(), |n| format!("{n} · {}", a.name));
+        let display = self.contact_name(&a.name);
         self.register(&user, &display)?;
         let since = self
             .matrix
@@ -50,6 +46,7 @@ impl Bot {
             user: user.clone(),
             room,
             since: Some(since),
+            name: Some(display),
             ..Chat::default()
         };
         self.state.spawned.insert(a.pane_id.clone(), chat.clone());
@@ -63,6 +60,42 @@ impl Bot {
             To::default(),
         )?;
         Ok(())
+    }
+
+    /// The display name of an agent's contact: the bot's name and the
+    /// agent's, or the agent's alone.
+    fn contact_name(&self, agent: &str) -> String {
+        match &self.deps.name {
+            Some(name) if self.deps.spawn_prefix => format!("{name} · {agent}"),
+            _ => agent.to_owned(),
+        }
+    }
+
+    /// Gives each contact the name its agent has now; one that fails is
+    /// tried again at the next poll.
+    pub(super) fn rename_contacts(&mut self, agents: &[Agent]) {
+        for a in agents {
+            let Some(chat) = self.state.spawned.get(&a.pane_id) else {
+                continue;
+            };
+            let name = self.contact_name(&a.name);
+            if chat.name.as_deref() == Some(name.as_str()) {
+                continue;
+            }
+            let user = chat.user.clone();
+            if let Err(err) = self.rename(&a.pane_id, &user, name) {
+                self.log(&format!("error: rename {user}: {err}"));
+            }
+        }
+    }
+
+    fn rename(&mut self, pane: &str, user: &str, name: String) -> Result<()> {
+        self.matrix
+            .set_displayname(user, As::User(user), Some(&name))?;
+        if let Some(chat) = self.state.spawned.get_mut(pane) {
+            chat.name = Some(name);
+        }
+        self.save()
     }
 
     /// A free user of the appservice for an agent of this name.

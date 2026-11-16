@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use indexmap::IndexMap;
 
 use super::contacts::Why;
-use super::{Bot, HOLD, PENDING_TTL, Post};
+use super::{Bot, HOLD, PENDING_TTL, Post, silent};
 use crate::Result;
 use crate::herdr::{Agent, Status, Turn};
 use crate::matrix::Api as _;
@@ -39,6 +39,7 @@ impl Bot {
             self.statuses = Some(current);
             return Ok(());
         };
+        self.rename_contacts(&agents);
         self.end_gone_chats(&current, now)?;
         let afk = self.away();
         let began = afk && !self.was_afk;
@@ -136,7 +137,9 @@ impl Bot {
             .state
             .pending
             .iter()
-            .filter(|(pane, _)| current.get(*pane) == Some(&Status::Working))
+            .filter(|(pane, waiting)| {
+                current.get(*pane) == Some(&Status::Working) && !waiting.local
+            })
             .map(|(pane, waiting)| waiting.origin.spawned.then(|| pane.clone()))
             .collect();
         let typing = self.typing.clone();
@@ -184,7 +187,7 @@ impl Bot {
         if gone.is_empty() { Ok(()) } else { self.save() }
     }
 
-    fn waiting(&mut self, pane: &str) -> &mut Pending {
+    pub(super) fn waiting(&mut self, pane: &str) -> &mut Pending {
         self.state.pending.get_mut(pane).expect("a turn under way")
     }
 
@@ -246,7 +249,9 @@ impl Bot {
             let text = last
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| "Done.".into());
-            self.post(a, "", Post::new(agents, chat).text(Some(&text)).no_hint())?;
+            if !silent(&text) {
+                self.post(a, "", Post::new(agents, chat).text(Some(&text)).no_hint())?;
+            }
             self.done(pane)?;
             if let Some((uuid, _)) = turn.messages.last() {
                 self.reported.insert(pane.to_owned(), uuid.clone());
@@ -279,11 +284,13 @@ impl Bot {
     /// Posts the held message as progress.
     fn flush(&mut self, a: &Agent, agents: &[Agent], chat: Option<&Chat>) -> Result<()> {
         if let Some((text, _)) = self.waiting(&a.pane_id).held.clone() {
-            self.post(
-                a,
-                "",
-                Post::new(agents, chat).text(Some(&text)).quiet().no_hint(),
-            )?;
+            if !silent(&text) && !self.waiting(&a.pane_id).local {
+                self.post(
+                    a,
+                    "",
+                    Post::new(agents, chat).text(Some(&text)).quiet().no_hint(),
+                )?;
+            }
             let waiting = self.waiting(&a.pane_id);
             waiting.last = Some(text);
             waiting.held = None;
@@ -313,11 +320,13 @@ impl Bot {
         } else {
             format!("is {}", a.status)
         };
-        self.post(
-            a,
-            &note,
-            Post::new(agents, chat.as_ref()).text(said.as_deref()),
-        )?;
+        if !said.as_deref().is_some_and(silent) {
+            self.post(
+                a,
+                &note,
+                Post::new(agents, chat.as_ref()).text(said.as_deref()),
+            )?;
+        }
         self.reported.insert(a.pane_id.clone(), uuid);
         Ok(())
     }

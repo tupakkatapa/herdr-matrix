@@ -10,7 +10,9 @@ A Matrix chat with the Claude Code agents that [herdr](https://github.com/ogulca
 - **Away notices**: after `!away`, every agent that stops or waits on a choice posts here, until `!here`; reply to answer it without switching
 - **Choices**: questions and permission prompts come as numbered lists; answer with a number, a key, your own text or a 👍
 - **Files and voice**: pictures and files are handed to the agent; voice messages are transcribed by whisper.cpp and count as written
-- **Own chats**: `!dm <name>` gives an agent a direct chat of its own, as an appservice user
+- **Own chats**: `!dm <name>` gives an agent a direct chat of its own, as an appservice user named after the agent
+- **Silent turns**: a turn whose last message is `NOOP` posts nothing, so a routine check can stay quiet
+- **Prompts from the machine**: `herdr-matrix prompt` hands a prompt to an agent, for example from a timer, and its turn posts in the chat
 
 ## Getting Started
 
@@ -72,6 +74,16 @@ A command acts on the agent of the message you reply to, else on the attached on
 | `!help` | Help text |
 
 A key (`1`-`9`, `y`, `n`, `enter`, `esc`, `tab`, `space`, arrows) answers a choice on the screen. A voice message of a key or a command word ("yes", "two", "screen 50") becomes that key or command; `!dm`, `!leave` and `!exit` cannot be spoken.
+
+## Prompts from the machine
+
+A program on the same machine, such as a systemd timer, prompts an agent through the running bot:
+
+```sh
+herdr-matrix prompt <agent> <text>...
+```
+
+The command queues the prompt and exits. It names the agent like `!attach`. The bot hands the text to the agent as written, without `[Element]`, and posts the last message of the turn in the agent's own chat, else in the main chat. An agent that works or waits on a choice does not get the prompt. The binary is not on `PATH`; use `${config.programs.herdr.matrix.package}/bin/herdr-matrix`.
 
 ## Limitations
 

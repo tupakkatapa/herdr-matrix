@@ -71,6 +71,9 @@ pub struct Pending {
     pub at: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last: Option<String>,
+    /// From the machine: progress is held, since the turn may end silent
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -101,6 +104,9 @@ pub struct Chat {
     pub user: String,
     pub room: String,
     pub since: Option<String>,
+    /// The contact's display name last set
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

@@ -6,6 +6,7 @@ mod contacts;
 mod fakes;
 mod files;
 mod limits;
+mod local;
 mod restarts;
 #[path = "../../src/testutil.rs"]
 mod testutil;

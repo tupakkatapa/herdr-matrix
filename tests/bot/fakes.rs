@@ -61,6 +61,8 @@ pub struct HerdrState {
     pub broken: HashSet<(String, String)>,
     /// What `agent list` answers instead of the agents
     pub list_out: Option<String>,
+    /// Workspace id → its label, when not `repo-<id>`
+    pub labels: HashMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -163,7 +165,10 @@ impl Herdr for FakeHerdr {
                     .collect();
                 let spaces: Vec<Value> = ids
                     .into_iter()
-                    .map(|w| json!({"workspace_id": w, "label": format!("repo-{w}")}))
+                    .map(|w| {
+                        let label = s.labels.get(w).cloned();
+                        json!({"workspace_id": w, "label": label.unwrap_or_else(|| format!("repo-{w}"))})
+                    })
                     .collect();
                 (0, json!({"result": {"workspaces": spaces}}).to_string())
             }
@@ -543,6 +548,8 @@ impl T {
                 name: None,
                 avatar: None,
                 spawn_avatar: None,
+                spawn_prefix: true,
+                inbox: Some(self.inbox()),
             },
         )
     }
@@ -666,6 +673,10 @@ impl T {
 
     pub fn files(&self) -> std::path::PathBuf {
         self.dir.path().join("files")
+    }
+
+    pub fn inbox(&self) -> std::path::PathBuf {
+        self.dir.path().join("prompts")
     }
 
     pub fn log_lines(&self) -> Vec<String> {

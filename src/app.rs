@@ -3,9 +3,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bot::{Bot, Deps};
+use crate::inbox::{self, Prompt};
 use crate::matrix::Http;
 use crate::state::Store;
 use crate::voice::{Bins, whisper};
@@ -26,6 +27,8 @@ pub struct Settings {
     pub name: String,
     pub avatar: Option<PathBuf>,
     pub spawn_avatar: Option<PathBuf>,
+    /// The bot's name before an agent's in the name of its contact
+    pub spawn_prefix: bool,
     /// The whisper.cpp model and the language it hears
     pub whisper: Option<(String, String)>,
 }
@@ -41,6 +44,7 @@ impl fmt::Debug for Settings {
             .field("name", &self.name)
             .field("avatar", &self.avatar)
             .field("spawn_avatar", &self.spawn_avatar)
+            .field("spawn_prefix", &self.spawn_prefix)
             .field("whisper", &self.whisper)
             .finish()
     }
@@ -66,6 +70,15 @@ fn safe_url(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
+/// Where the bot keeps files from the chat and prompts from the machine:
+/// `$XDG_RUNTIME_DIR/herdr-matrix`, else `$HERDR_MATRIX_STATE/files`.
+#[must_use]
+pub fn files_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    env("XDG_RUNTIME_DIR")
+        .map(|run| Path::new(&run).join("herdr-matrix"))
+        .or_else(|| env("HERDR_MATRIX_STATE").map(|state| Path::new(&state).join("files")))
+}
+
 /// The service's settings.
 ///
 /// # Errors
@@ -79,18 +92,25 @@ pub fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<Settings> {
         )));
     }
     let state = PathBuf::from(need("HERDR_MATRIX_STATE")?);
+    let spawn_prefix = match env("HERDR_MATRIX_SPAWN_PREFIX").as_deref() {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
+            return Err(Error::Setting(format!(
+                "HERDR_MATRIX_SPAWN_PREFIX {other} is not true or false"
+            )));
+        }
+    };
     Ok(Settings {
         homeserver,
         token: need("HERDR_MATRIX_TOKEN")?,
         owner: need("HERDR_MATRIX_OWNER")?,
         state_path: state.join("matrix-state.json"),
-        files: env("XDG_RUNTIME_DIR").map_or_else(
-            || state.join("files"),
-            |run| Path::new(&run).join("herdr-matrix"),
-        ),
+        files: files_dir(env).unwrap_or_else(|| state.join("files")),
         name: need("HERDR_MATRIX_NAME")?,
         avatar: env("HERDR_MATRIX_AVATAR").map(PathBuf::from),
         spawn_avatar: env("HERDR_MATRIX_SPAWN_AVATAR").map(PathBuf::from),
+        spawn_prefix,
         whisper: env("HERDR_MATRIX_WHISPER_MODEL").map(|model| {
             (
                 model,
@@ -110,10 +130,12 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Bot> {
     let s = settings(env)?;
     let mut deps = Deps {
         owner: s.owner,
+        inbox: Some(s.files.join("prompts")),
         files: s.files,
         name: Some(s.name),
         avatar: s.avatar,
         spawn_avatar: s.spawn_avatar,
+        spawn_prefix: s.spawn_prefix,
         ..Deps::default()
     };
     if let Some((model, language)) = s.whisper {
@@ -134,6 +156,38 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Bot> {
         state,
         deps,
     ))
+}
+
+/// Queues a prompt for the running bot, which hands it to the agent
+/// `agent` names; the path of its file.
+///
+/// # Errors
+/// When the agent or the text is empty, when neither `XDG_RUNTIME_DIR` nor
+/// `HERDR_MATRIX_STATE` is set, or when the file cannot be written.
+pub fn queue_prompt(
+    env: &dyn Fn(&str) -> Option<String>,
+    agent: &str,
+    text: &str,
+) -> Result<PathBuf> {
+    if agent.is_empty() || text.is_empty() {
+        return Err(Error::Setting(
+            "the agent and the text must not be empty".into(),
+        ));
+    }
+    let files = files_dir(env).ok_or_else(|| {
+        Error::Setting("neither XDG_RUNTIME_DIR nor HERDR_MATRIX_STATE is set".into())
+    })?;
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    inbox::queue(
+        &files.join("prompts"),
+        &Prompt {
+            agent: agent.to_owned(),
+            text: text.to_owned(),
+            at,
+        },
+    )
 }
 
 /// Ticks until `sleep` says stop, waiting longer after each failure in a
@@ -237,6 +291,75 @@ mod tests {
         let env = self::env(dir.path(), &[("XDG_RUNTIME_DIR", "/run/user/1000".into())]);
         let s = settings(&|k| env.get(k).cloned()).expect("settings");
         assert_eq!(s.files, Path::new("/run/user/1000/herdr-matrix"));
+    }
+
+    #[test]
+    fn spawn_prefix_is_true_or_false() {
+        let dir = TempDir::new();
+        for (value, want) in [
+            (None, Ok(true)),
+            (Some("true"), Ok(true)),
+            (Some("false"), Ok(false)),
+            (
+                Some("maybe"),
+                Err("HERDR_MATRIX_SPAWN_PREFIX maybe is not true or false".to_owned()),
+            ),
+        ] {
+            let extra: Vec<(&str, String)> = value
+                .map(|v| ("HERDR_MATRIX_SPAWN_PREFIX", v.to_owned()))
+                .into_iter()
+                .collect();
+            let env = env(dir.path(), &extra);
+            let s = settings(&|k| env.get(k).cloned());
+            assert_eq!(
+                s.map(|s| s.spawn_prefix).map_err(|e| e.to_string()),
+                want,
+                "{value:?}"
+            );
+        }
+        let env = env(dir.path(), &[("HERDR_MATRIX_SPAWN_PREFIX", "false".into())]);
+        let bot = from_env(&|k| env.get(k).cloned()).expect("bot");
+        assert!(!bot.deps().spawn_prefix);
+        assert_eq!(
+            bot.deps().inbox.as_deref(),
+            Some(dir.path().join("files/prompts").as_path())
+        );
+    }
+
+    #[test]
+    fn prompt_is_queued_where_the_bot_takes_it() {
+        let dir = TempDir::new();
+        let run = dir.path().join("run");
+        for (env, inbox) in [
+            (
+                vec![("XDG_RUNTIME_DIR", run.display().to_string())],
+                run.join("herdr-matrix/prompts"),
+            ),
+            (
+                vec![("HERDR_MATRIX_STATE", dir.path().display().to_string())],
+                dir.path().join("files/prompts"),
+            ),
+        ] {
+            let env: HashMap<&str, String> = env.into_iter().collect();
+            let path = queue_prompt(&|k| env.get(k).cloned(), "mail", "Check it").expect("queued");
+            assert_eq!(path.parent(), Some(inbox.as_path()));
+            let taken = crate::inbox::take(&inbox, &|_| {}).expect("take");
+            assert_eq!(
+                taken
+                    .iter()
+                    .map(|p| (p.agent.as_str(), p.text.as_str()))
+                    .collect::<Vec<_>>(),
+                [("mail", "Check it")]
+            );
+            assert!(taken[0].at > 1_700_000_000.0);
+        }
+        let err = queue_prompt(&|_| None, "mail", "Check it").expect_err("nowhere");
+        assert!(matches!(err, Error::Setting(_)), "{err}");
+        let env = HashMap::from([("XDG_RUNTIME_DIR", run.display().to_string())]);
+        for (agent, text) in [("", "Check it"), ("mail", "")] {
+            let err = queue_prompt(&|k| env.get(k).cloned(), agent, text).expect_err("empty");
+            assert!(matches!(err, Error::Setting(_)), "{err}");
+        }
     }
 
     #[test]

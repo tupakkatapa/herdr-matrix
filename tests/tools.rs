@@ -5,6 +5,7 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -129,6 +130,49 @@ fn hung_tool_is_named() {
     let err = whisper(&bins, &audio, "model", "auto").expect_err("times out");
     assert_eq!(err.to_string(), "ffmpeg timed out");
     assert!(started.elapsed() < Duration::from_secs(4));
+}
+
+/// The binary, with `XDG_RUNTIME_DIR` alone set, so it can start no bot;
+/// its exit code and what it wrote on stderr.
+fn herdr_matrix(run: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-matrix"))
+        .args(args)
+        .env_clear()
+        .env("XDG_RUNTIME_DIR", run)
+        .output()
+        .expect("ran");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn prompt_command_queues() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let inbox = dir.path().join("herdr-matrix/prompts");
+    let (code, _) = herdr_matrix(dir.path(), &["prompt", "mail", "Check", "the  mail"]);
+    assert_eq!(code, Some(0));
+    let files: Vec<PathBuf> = fs::read_dir(&inbox)
+        .expect("a prompt directory")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert_eq!(files.len(), 1);
+    let prompt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&files[0]).expect("read")).expect("JSON");
+    assert_eq!(
+        (&prompt["agent"], &prompt["text"]),
+        (&"mail".into(), &"Check the  mail".into())
+    );
+    for args in [&["bogus"][..], &["prompt"], &["prompt", "mail"]] {
+        let (code, err) = herdr_matrix(dir.path(), args);
+        assert_eq!(code, Some(2), "{args:?}");
+        assert!(err.starts_with("usage: herdr-matrix"), "{args:?}: {err}");
+    }
+    let (code, err) = herdr_matrix(dir.path(), &["prompt", "", "hi"]);
+    assert_eq!(code, Some(1), "{err}");
+    assert_eq!(fs::read_dir(&inbox).expect("list").count(), 1);
 }
 
 #[test]

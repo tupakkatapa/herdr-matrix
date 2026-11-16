@@ -24,6 +24,8 @@ use crate::{Error, Result};
 
 /// Marks a prompt from the chat, so the agent answers for a phone
 pub const MARK: &str = "[Element]";
+/// The whole last message of a turn that posts nothing
+pub const SILENT: &str = "NOOP";
 /// Lines of a screen at most
 pub const SCREEN_MAX: u64 = 200;
 /// Lines of a screen shown unless asked for more
@@ -66,6 +68,10 @@ pub struct Deps {
     pub avatar: Option<PathBuf>,
     /// The picture of an agent's own contact
     pub spawn_avatar: Option<PathBuf>,
+    /// `name` before an agent's in the name of its contact
+    pub spawn_prefix: bool,
+    /// Where `herdr-matrix prompt` queues prompts from the machine
+    pub inbox: Option<PathBuf>,
 }
 
 impl Default for Deps {
@@ -87,6 +93,8 @@ impl Default for Deps {
             name: None,
             avatar: None,
             spawn_avatar: None,
+            spawn_prefix: true,
+            inbox: None,
         }
     }
 }
@@ -379,6 +387,9 @@ impl Bot {
         }
         self.onboard()?;
         self.sync()?;
+        if let Err(err) = self.local() {
+            self.log(&format!("error: prompts: {err}"));
+        }
         let now = self.now();
         if self
             .last_poll
@@ -511,6 +522,11 @@ impl Bot {
     fn turn(&self, a: &Agent) -> Turn {
         (self.deps.answer)(a).unwrap_or_default()
     }
+}
+
+/// True for a message that says the turn has nothing to post.
+fn silent(text: &str) -> bool {
+    text.trim() == SILENT
 }
 
 /// What an agent does, as the chat says it.

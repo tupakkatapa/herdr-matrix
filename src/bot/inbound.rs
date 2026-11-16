@@ -9,6 +9,7 @@ use super::{Bot, MARK, STALE, To};
 use crate::commands::{KEY_HINT, KEYS, reaction, spoken};
 use crate::files;
 use crate::herdr::{self, Agent, Herdr, Status};
+use crate::inbox::{self, Prompt};
 use crate::matrix::{Api as _, As, Inbound, Media, SYNC_WAIT, What};
 use crate::state::{Chat, Origin};
 use crate::{Error, Result};
@@ -329,6 +330,78 @@ impl Bot {
                 chat: chat.as_ref(),
             },
         )
+    }
+
+    /// Hands the prompts `herdr-matrix prompt` queued to their agents.
+    ///
+    /// # Errors
+    /// When the prompt directory cannot be read, or herdr cannot list the
+    /// agents.
+    pub fn local(&mut self) -> Result<()> {
+        let Some(dir) = self.deps.inbox.clone() else {
+            return Ok(());
+        };
+        let prompts = inbox::take(&dir, &*self.deps.log)?;
+        if prompts.is_empty() {
+            return Ok(());
+        }
+        let agents = self.agents()?;
+        for prompt in &prompts {
+            if let Err(err) = self.local_prompt(prompt, &agents) {
+                self.log(&format!("error: prompts: {err}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn local_prompt(&mut self, prompt: &Prompt, agents: &[Agent]) -> Result<()> {
+        let dropped = |why: String| format!("prompt for \"{}\" dropped: {why}", prompt.agent);
+        if self.now() - prompt.at > STALE.as_secs_f64() {
+            let minutes = STALE.as_secs_f64() / 60.0;
+            self.log(&dropped(format!("older than {minutes:.0} minutes")));
+            return Ok(());
+        }
+        let found = if prompt.agent.is_empty() {
+            Err(agents.len())
+        } else {
+            herdr::find(agents, &prompt.agent)
+        };
+        let a = match found {
+            Ok(a) => a,
+            Err(n) => {
+                self.log(&dropped(format!("it matches {n} agents")));
+                return Ok(());
+            }
+        };
+        let pane = a.pane_id.as_str();
+        let busy = match a.status {
+            Status::Blocked => Some("waits on a choice"),
+            Status::Working => Some("works"),
+            _ => None,
+        };
+        if let Some(busy) = busy {
+            self.log(&format!("{pane} prompt dropped: it {busy}"));
+            return Ok(());
+        }
+        let turn = self.turn(a);
+        if let Err(err) = herdr::prompt(self.deps.herdr.as_mut(), pane, &prompt.text) {
+            self.log(&format!("error: {pane} prompt: {err}"));
+            return Ok(());
+        }
+        self.log(&format!("{pane} local {}", prompt.text.chars().count()));
+        self.state.asked.shift_remove(pane);
+        let spawned = self.state.spawned.contains_key(pane);
+        self.expect(
+            pane,
+            &turn,
+            Origin {
+                slash: prompt.text.starts_with('/'),
+                spawned,
+                ..Origin::default()
+            },
+        )?;
+        self.waiting(pane).local = true;
+        self.save()
     }
 
     /// The agent of the message replied to, else the attached one.

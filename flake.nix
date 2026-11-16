@@ -154,6 +154,7 @@
               module-config = pass "herdr-matrix-module-config" (
                 lib.elem "\"HERDR_MATRIX_HOMESERVER=https://m.example.org/a%%b\\\"c\""
                   (service bare).Service.Environment
+                && lib.elem "\"HERDR_MATRIX_SPAWN_PREFIX=true\"" (service bare).Service.Environment
                 && (service bare).Unit.Wants == [ ]
                 && !(bare.systemd.user.services ? herdr-matrix-models)
                 && !(lib.hasInfix "whisper" (path bare))

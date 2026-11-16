@@ -8,6 +8,7 @@ pub mod commands;
 pub mod error;
 pub mod files;
 pub mod herdr;
+pub mod inbox;
 pub mod json;
 pub mod matrix;
 pub mod process;

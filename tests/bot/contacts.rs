@@ -684,3 +684,86 @@ fn turn_whose_chat_ended_is_dropped() {
     t.poll();
     assert!(t.bot.state().pending.is_empty());
 }
+
+/// The display names set for a contact, in order.
+fn names(t: &T, user: &str) -> Vec<String> {
+    t.matrix
+        .as_user(user)
+        .into_iter()
+        .filter(|c| c.0 == "PUT" && c.1.ends_with("/displayname"))
+        .map(|c| {
+            c.2.expect("a body")["displayname"]
+                .as_str()
+                .expect("a name")
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn contact_follows_a_rename() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.bot.deps_mut().name = Some("Claude".into());
+    let chat = t.spawn("wA:p1", "repo-wA");
+    t.poll();
+    t.poll();
+    assert_eq!(names(&t, &chat.user), ["Claude · repo-wA"]);
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wA".into(), "mail".into());
+    t.matrix.0.borrow_mut().refuse.push("/displayname".into());
+    t.clear_log();
+    t.poll();
+    assert_eq!(
+        t.log_lines(),
+        [format!(
+            "error: rename {}: cannot reach the homeserver: /profile/{}/displayname failed",
+            chat.user,
+            quote(&chat.user)
+        )]
+    );
+    t.matrix.0.borrow_mut().refuse.clear();
+    t.poll();
+    t.poll();
+    assert_eq!(
+        names(&t, &chat.user),
+        ["Claude · repo-wA", "Claude · mail", "Claude · mail"]
+    );
+    let now = &t.bot.state().spawned["wA:p1"];
+    assert_eq!(
+        (now.user.as_str(), now.room.as_str(), now.name.as_deref()),
+        (
+            chat.user.as_str(),
+            chat.room.as_str(),
+            Some("Claude · mail")
+        )
+    );
+    assert_eq!(
+        t.matrix
+            .calls()
+            .iter()
+            .filter(|c| c.1 == "/createRoom")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn contact_name_without_prefix() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.bot.deps_mut().name = Some("Claude".into());
+    let a = t.spawn("wA:p1", "repo-wA");
+    t.bot.deps_mut().spawn_prefix = false;
+    let b = t.spawn("wB:p1", "repo-wB");
+    assert_eq!(names(&t, &b.user), ["repo-wB"]);
+    t.poll();
+    t.poll();
+    t.poll();
+    assert_eq!(names(&t, &a.user), ["Claude · repo-wA", "repo-wA"]);
+    assert_eq!(names(&t, &b.user), ["repo-wB"]);
+}
