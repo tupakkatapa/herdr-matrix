@@ -19,7 +19,7 @@ use crate::{Error, Result};
 pub const FILE_TTL: Duration = Duration::from_hours(24);
 
 /// Eight random characters for a file name.
-fn random_name() -> String {
+pub(crate) fn random_name() -> String {
     let mut n = RandomState::new().build_hasher().finish();
     let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789_";
     (0..8)
@@ -39,18 +39,7 @@ fn random_name() -> String {
 pub fn store(dir: &Path, now: f64, name: &str, data: &[u8]) -> Result<PathBuf> {
     static UNSAFE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"[^A-Za-z0-9._-]").expect("a valid pattern"));
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    // The directory may sit in a shared /tmp
-    let st = fs::symlink_metadata(dir)?;
-    if !st.is_dir() || st.uid() != own_uid()? || st.permissions().mode() & 0o7777 != 0o700 {
-        return Err(Error::Refused(format!(
-            "{} is not a private directory",
-            dir.display()
-        )));
-    }
+    private_dir(dir)?;
     purge(dir, now - FILE_TTL.as_secs_f64())?;
     let base = name.rsplit('/').next().unwrap_or_default();
     let suffix = UNSAFE.replace_all(base, "_");
@@ -71,6 +60,27 @@ pub fn store(dir: &Path, now: f64, name: &str, data: &[u8]) -> Result<PathBuf> {
             Err(err) => return Err(err.into()),
         }
     }
+}
+
+/// Makes `dir` when it is missing, and checks that it is private: a
+/// directory of this user, mode `0700`, not a symlink.
+///
+/// # Errors
+/// When `dir` cannot be made or is not private.
+pub fn private_dir(dir: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    // The directory may sit in a shared /tmp
+    let st = fs::symlink_metadata(dir)?;
+    if !st.is_dir() || st.uid() != own_uid()? || st.permissions().mode() & 0o7777 != 0o700 {
+        return Err(Error::Refused(format!(
+            "{} is not a private directory",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Removes the files in `dir` older than `old`, seconds since the epoch.
