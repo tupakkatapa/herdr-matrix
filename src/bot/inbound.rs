@@ -3,14 +3,19 @@
 
 use std::fmt;
 use std::fs;
+use std::io::{Read as _, Seek as _};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use super::{Bot, MARK, STALE, To, same_dir};
+use serde_json::json;
+
+use super::{Bot, FILES_WAIT, MARK, STALE, To, same_dir};
 use crate::commands::{KEY_HINT, KEYS, reaction, spoken};
 use crate::files;
 use crate::herdr::{self, Agent, Herdr, Status};
-use crate::inbox::{self, Prompt};
+use crate::inbox::{self, Prompt, Upload};
 use crate::matrix::{Api as _, As, Inbound, Media, SYNC_WAIT, What};
+use crate::media;
 use crate::state::{Chat, Origin};
 use crate::{Error, Result};
 
@@ -34,6 +39,34 @@ impl fmt::Display for Delivery {
             Self::Answer => "answer",
         })
     }
+}
+
+/// Who files from the chat are for: the agent in a pane, from the main chat
+/// or from its own chat.
+#[derive(Clone, PartialEq, Eq)]
+enum Holder {
+    Main(String),
+    Own(String),
+}
+
+impl Holder {
+    /// The pane whose own chat they came from; none for the main chat.
+    fn contact(&self) -> Option<&str> {
+        match self {
+            Self::Main(_) => None,
+            Self::Own(pane) => Some(pane),
+        }
+    }
+}
+
+/// Files from the chat that wait for more for one agent, their captions,
+/// the last event, and when the last came.
+pub(super) struct Held {
+    to: Holder,
+    paths: Vec<PathBuf>,
+    captions: Vec<String>,
+    id: Option<String>,
+    at: f64,
 }
 
 /// A message of the owner on its way to an agent, and what kind it is.
@@ -140,25 +173,111 @@ impl Bot {
             {
                 return;
             }
+            if !matches!(ev.what, What::File(_)) {
+                self.hand_over(|held| held.to.contact() == pane);
+            }
             let done = match &ev.what {
                 What::Reaction { key, target } => self.react(key, target.as_deref(), pane),
                 _ => self.handle(ev, pane),
             };
             if let Err(err) = done {
-                self.log(&format!("error: {err}"));
                 let verb = match ev.what {
                     What::Text(_) => "deliver the message",
                     What::File(_) => "take the file",
                     What::Voice(_) => "hear the voice message",
                     What::Reaction { .. } => "answer with the reaction",
                 };
-                let mut said = format!("Failed to {verb}: {err}");
-                if let Some(hint) = err.hint() {
-                    said = format!("{said}. {hint}");
-                }
-                self.notice(&said, To::chat(chat));
+                self.failed(verb, &err, chat);
             }
         }
+    }
+
+    /// Logs a failure, and says it in the chat with what to do about it.
+    fn failed(&mut self, verb: &str, err: &Error, chat: Option<&Chat>) {
+        self.log(&format!("error: {err}"));
+        let mut said = format!("Failed to {verb}: {err}");
+        if let Some(hint) = err.hint() {
+            said = format!("{said}. {hint}");
+        }
+        self.notice(&said, To::chat(chat));
+    }
+
+    /// Saves a file from the chat in `dir` and holds it for `to`, beside
+    /// the files that came for it before.
+    fn hold(&mut self, to: Holder, media: &Media, ev: &Inbound, dir: &Path) -> Result<()> {
+        let path = self.keep(media, dir)?;
+        let at = self.now();
+        let i = if let Some(i) = self.held_files.iter().position(|h| h.to == to) {
+            i
+        } else {
+            self.held_files.push(Held {
+                to,
+                paths: Vec::new(),
+                captions: Vec::new(),
+                id: None,
+                at,
+            });
+            self.held_files.len() - 1
+        };
+        let held = &mut self.held_files[i];
+        held.paths.push(path);
+        if media.body != media.name {
+            held.captions.push(media.body.clone());
+        }
+        held.id = ev.id.clone().or(held.id.take());
+        held.at = at;
+        Ok(())
+    }
+
+    /// Hands over the files from the chat for which no more came in
+    /// `FILES_WAIT`.
+    pub fn hand_over_files(&mut self) {
+        let old = self.now() - FILES_WAIT.as_secs_f64();
+        self.hand_over(|held| held.at <= old);
+    }
+
+    /// Hands over the held files `due` picks, each agent's as one prompt.
+    fn hand_over(&mut self, due: impl Fn(&Held) -> bool) {
+        let (now, later) = std::mem::take(&mut self.held_files)
+            .into_iter()
+            .partition(due);
+        self.held_files = later;
+        for held in now {
+            let chat = held
+                .to
+                .contact()
+                .map(|pane| self.state.spawned.get(pane).cloned().ok_or(()));
+            // An own chat that ended takes nothing
+            let Ok(chat) = chat.transpose() else {
+                continue;
+            };
+            if let Err(err) = self.hand(&held, chat.as_ref()) {
+                self.failed("take the file", &err, chat.as_ref());
+            }
+        }
+    }
+
+    fn hand(&mut self, held: &Held, chat: Option<&Chat>) -> Result<()> {
+        let text = files_prompt(&held.captions, &held.paths);
+        let (Holder::Main(pane) | Holder::Own(pane)) = &held.to;
+        let agents = self.agents()?;
+        let Some(a) = agents.iter().find(|a| &a.pane_id == pane) else {
+            self.say(
+                "The agent is not running right now; nothing was sent.",
+                To::chat(chat),
+            )?;
+            return Ok(());
+        };
+        self.deliver(
+            a,
+            &agents,
+            Message {
+                id: held.id.as_deref(),
+                text: &text,
+                kind: Delivery::File,
+                chat,
+            },
+        )
     }
 
     /// A message about the batch being handled; one that fails is logged,
@@ -219,27 +338,17 @@ impl Bot {
         self.expect(&pane, &turn, Origin::default())
     }
 
-    /// Saves a picture or file from the chat; the prompt that hands it to
-    /// an agent.
-    fn fetch(&mut self, media: &Media) -> Result<String> {
-        let path = self.keep(media)?;
-        let path = path.display();
-        Ok(if media.body == media.name {
-            format!("See the file {path}")
-        } else {
-            format!("{}\n\n{path}", media.body)
-        })
-    }
-
-    /// Saves a file from the chat in the private directory; its path.
-    fn keep(&mut self, media: &Media) -> Result<std::path::PathBuf> {
+    /// Saves a file from the chat in `dir`, a private directory; its path.
+    fn keep(&mut self, media: &Media, dir: &Path) -> Result<std::path::PathBuf> {
         let Some(url) = media.url.as_deref().filter(|u| !u.is_empty()) else {
             return Err(Error::Refused(
                 "the file is encrypted, and the bot cannot read encrypted chats".into(),
             ));
         };
-        let data = self.matrix.download(url)?;
-        files::store(&self.deps.files, self.now(), &media.name, &data)
+        let now = self.now();
+        files::store(dir, now, &media.name, &mut |file| {
+            self.matrix.download(url, file)
+        })
     }
 
     /// What the owner says in a voice message, as typed; None when nothing.
@@ -251,7 +360,8 @@ impl Bot {
             )?;
             return Ok(None);
         }
-        let path = self.keep(media)?;
+        let dir = self.deps.files.clone();
+        let path = self.keep(media, &dir)?;
         let heard = self.deps.transcribe.as_ref().map(|hear| hear(&path));
         if let Err(err) = fs::remove_file(&path)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -314,11 +424,21 @@ impl Bot {
         let Some(a) = mine.or_else(|| self.target(ev, &agents)) else {
             return self.ask_which("Not attached. !attach one of:", &agents);
         };
-        let voice = matches!(ev.what, What::Voice(_));
-        let (text, kind) = match media {
-            Some(media) => (self.fetch(media)?, Delivery::File),
-            None if voice => (text, Delivery::Voice),
-            None => (text, Delivery::Prompt),
+        if let Some(media) = media {
+            let to = match contact {
+                Some(_) => Holder::Own(a.pane_id.clone()),
+                None => Holder::Main(a.pane_id.clone()),
+            };
+            // A confined agent reads only its own files
+            let dir = self
+                .sandbox(a)
+                .map_or_else(|| self.deps.files.clone(), |s| s.files.clone());
+            return self.hold(to, media, ev, &dir);
+        }
+        let kind = if matches!(ev.what, What::Voice(_)) {
+            Delivery::Voice
+        } else {
+            Delivery::Prompt
         };
         self.deliver(
             a,
@@ -332,26 +452,152 @@ impl Bot {
         )
     }
 
-    /// Hands the prompts `herdr-matrix prompt` queued to their agents.
+    /// Hands the prompts `herdr-matrix prompt` queued to their agents, and
+    /// posts the files `herdr-matrix send` queued.
     ///
     /// # Errors
-    /// When the prompt directory cannot be read, or herdr cannot list the
+    /// When a queue directory cannot be read, or herdr cannot list the
     /// agents.
     pub fn local(&mut self) -> Result<()> {
-        let Some(dir) = self.deps.inbox.clone() else {
-            return Ok(());
+        let prompts = match self.deps.inbox.clone() {
+            Some(dir) => inbox::take(&dir, &*self.deps.log)?,
+            None => Vec::new(),
         };
-        let prompts = inbox::take(&dir, &*self.deps.log)?;
-        if prompts.is_empty() {
+        let mut uploads: Vec<(Upload, PathBuf, Option<String>)> = match self.deps.uploads.clone() {
+            Some(dir) => inbox::take_uploads(&dir, self.now(), &*self.deps.log)?,
+            None => Vec::new(),
+        }
+        .into_iter()
+        .map(|(upload, data)| (upload, data, None))
+        .collect();
+        uploads.extend(self.confined_uploads());
+        if prompts.is_empty() && uploads.is_empty() {
             return Ok(());
         }
-        let agents = self.agents()?;
+        let agents = self.agents();
+        for (upload, data, cwd) in &uploads {
+            if let Ok(agents) = &agents {
+                match cwd {
+                    Some(cwd) => self.confined_upload(upload, data, cwd, agents),
+                    None => self.local_upload(upload, data, agents),
+                }
+            }
+            if let Err(err) = fs::remove_file(data)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                self.log(&format!("error: {}: {err}", data.display()));
+            }
+        }
+        let agents = agents?;
         for prompt in &prompts {
             if let Err(err) = self.local_prompt(prompt, &agents) {
                 self.log(&format!("error: prompts: {err}"));
             }
         }
         Ok(())
+    }
+
+    /// The files the confined agents queued, each with the working
+    /// directory of its agent. A queue that cannot be read holds nothing.
+    fn confined_uploads(&self) -> Vec<(Upload, PathBuf, Option<String>)> {
+        let mut found = Vec::new();
+        for settings in &self.deps.agents {
+            let Some(sandbox) = settings.sandbox.as_ref() else {
+                continue;
+            };
+            match inbox::take_uploads(&sandbox.uploads, self.now(), &*self.deps.log) {
+                Ok(taken) => found.extend(
+                    taken
+                        .into_iter()
+                        .map(|(upload, data)| (upload, data, Some(settings.cwd.clone()))),
+                ),
+                Err(err) => self.log(&format!("error: uploads of {}: {err}", sandbox.id)),
+            }
+        }
+        found
+    }
+
+    /// Posts a file a confined agent queued, as the one agent working in
+    /// `cwd`: the queue names the agent, never the entry.
+    fn confined_upload(&mut self, upload: &Upload, data: &Path, cwd: &str, agents: &[Agent]) {
+        let working: Vec<&Agent> = agents
+            .iter()
+            .filter(|a| a.cwd.as_deref().is_some_and(|dir| same_dir(dir, cwd)))
+            .collect();
+        let [a] = working.as_slice() else {
+            self.log(&format!(
+                "upload for \"{cwd}\" dropped: it matches {} agents",
+                working.len()
+            ));
+            return;
+        };
+        let upload = Upload {
+            pane: a.pane_id.clone(),
+            ..upload.clone()
+        };
+        self.local_upload(&upload, data, agents);
+    }
+
+    /// Posts a file an agent queued in its own chat, else in the main chat;
+    /// one that fails is said there and logged.
+    fn local_upload(&mut self, upload: &Upload, data: &Path, agents: &[Agent]) {
+        let pane = upload.pane.as_str();
+        let dropped = |why: &str| format!("upload for \"{pane}\" dropped: {why}");
+        if self.now() - upload.at > STALE.as_secs_f64() {
+            let minutes = STALE.as_secs_f64() / 60.0;
+            self.log(&dropped(&format!("older than {minutes:.0} minutes")));
+            return;
+        }
+        if !agents.iter().any(|a| a.pane_id == pane) {
+            self.log(&dropped("no agent works there"));
+            return;
+        }
+        let chat = self.state.spawned.get(pane).cloned();
+        match self.post_file(upload, data, chat.as_ref()) {
+            Ok(len) => self.log(&format!("{pane} upload {len}")),
+            Err(err) => {
+                self.log(&format!("error: {pane} upload: {err}"));
+                self.notice(
+                    &format!("Could not send {}: {err}", upload.name),
+                    To::chat(chat.as_ref()).quiet(),
+                );
+            }
+        }
+    }
+
+    /// Uploads a queued file within the homeserver's limit, and posts it so
+    /// that a reply to it reaches the agent; its size.
+    fn post_file(&mut self, upload: &Upload, data: &Path, chat: Option<&Chat>) -> Result<u64> {
+        let mut file = files::open_inside(data.parent().unwrap_or(data), data)?;
+        let len = file.metadata()?.len();
+        if let Some(limit) = self.matrix.upload_limit()?
+            && len > limit
+        {
+            return Err(Error::Refused(format!(
+                "it is {}, and the homeserver takes {} at most",
+                megabytes(len, true),
+                megabytes(limit, false)
+            )));
+        }
+        let mut head = Vec::new();
+        (&mut file)
+            .take(media::HEAD as u64)
+            .read_to_end(&mut head)?;
+        file.rewind()?;
+        let kind = media::kind(&upload.name, &head);
+        let url = self.matrix.upload(&mut file, len, kind.mimetype)?;
+        let mut info = json!({"mimetype": kind.mimetype, "size": len});
+        if let Some((w, h)) = kind.size {
+            info["w"] = json!(w);
+            info["h"] = json!(h);
+        }
+        let content = json!({"msgtype": kind.msgtype,
+            "body": upload.caption.as_deref().unwrap_or(&upload.name),
+            "filename": upload.name, "url": url, "info": info});
+        let sent = self.send(&content, Some(&upload.pane), chat, &url);
+        self.txns.shift_remove(&url);
+        sent?;
+        Ok(len)
     }
 
     fn local_prompt(&mut self, prompt: &Prompt, agents: &[Agent]) -> Result<()> {
@@ -526,6 +772,25 @@ fn addressee<'a>(prompt: &Prompt, agents: &'a [Agent]) -> std::result::Result<&'
     } else {
         Err(matches.len())
     }
+}
+
+/// The prompt for files from the chat: one as its caption, else "See the
+/// file", and its path; several as their captions, then one path a line.
+fn files_prompt(captions: &[String], paths: &[PathBuf]) -> String {
+    let paths: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    let head = match (captions.is_empty(), paths.as_slice()) {
+        (true, [path]) => return format!("See the file {path}"),
+        (true, _) => "See the files".to_owned(),
+        (false, _) => captions.join("\n\n"),
+    };
+    format!("{head}\n\n{}", paths.join("\n"))
+}
+
+/// Bytes in megabytes with one decimal, rounded up or down.
+fn megabytes(bytes: u64, up: bool) -> String {
+    let mb = 1 << 20;
+    let tenths = (u128::from(bytes) * 10 + if up { mb - 1 } else { 0 }) / mb;
+    format!("{}.{} MB", tenths / 10, tenths % 10)
 }
 
 /// Picks the entry of a question that takes a written answer, and types

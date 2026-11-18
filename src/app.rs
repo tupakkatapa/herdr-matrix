@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bot::{AgentSettings, Bot, Deps};
-use crate::inbox::{self, Prompt};
+use crate::inbox::{self, Prompt, Upload};
 use crate::matrix::Http;
 use crate::state::Store;
 use crate::voice::{Bins, whisper};
@@ -73,13 +73,25 @@ pub(crate) fn safe_url(url: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Where the bot keeps files from the chat and prompts from the machine:
-/// `$XDG_RUNTIME_DIR/herdr-matrix`, else `$HERDR_MATRIX_STATE/files`.
+/// Where the bot keeps files of the chat and what the machine queues for
+/// it: `$XDG_CACHE_HOME/herdr-matrix`, else `$HOME/.cache/herdr-matrix`.
 #[must_use]
 pub fn files_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    env("XDG_RUNTIME_DIR")
-        .map(|run| Path::new(&run).join("herdr-matrix"))
-        .or_else(|| env("HERDR_MATRIX_STATE").map(|state| Path::new(&state).join("files")))
+    // A relative or empty XDG_CACHE_HOME is to be ignored
+    env("XDG_CACHE_HOME")
+        .filter(|cache| cache.starts_with('/'))
+        .map(PathBuf::from)
+        .or_else(|| {
+            env("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| Path::new(&home).join(".cache"))
+        })
+        .map(|cache| cache.join("herdr-matrix"))
+}
+
+/// The files directory, or why there is none.
+fn need_files_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
+    files_dir(env).ok_or_else(|| Error::Setting("neither XDG_CACHE_HOME nor HOME is set".into()))
 }
 
 /// The service's settings.
@@ -116,7 +128,7 @@ pub fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<Settings> {
         token: need("HERDR_MATRIX_TOKEN")?,
         owner: need("HERDR_MATRIX_OWNER")?,
         state_path: state.join("matrix-state.json"),
-        files: files_dir(env).unwrap_or_else(|| state.join("files")),
+        files: need_files_dir(env)?,
         name: need("HERDR_MATRIX_NAME")?,
         avatar: env("HERDR_MATRIX_AVATAR").map(PathBuf::from),
         spawn_avatar: env("HERDR_MATRIX_SPAWN_AVATAR").map(PathBuf::from),
@@ -142,6 +154,7 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Bot> {
     let mut deps = Deps {
         owner: s.owner,
         inbox: Some(s.files.join("prompts")),
+        uploads: Some(s.files.join("uploads")),
         files: s.files,
         name: Some(s.name),
         avatar: s.avatar,
@@ -182,8 +195,8 @@ pub enum Target<'a> {
 /// `target` names; the path of its file.
 ///
 /// # Errors
-/// When the target or the text is empty, when neither `XDG_RUNTIME_DIR` nor
-/// `HERDR_MATRIX_STATE` is set, or when the file cannot be written.
+/// When the target or the text is empty, when neither `XDG_CACHE_HOME` nor
+/// `HOME` is set, or when the file cannot be written.
 pub fn queue_prompt(
     env: &dyn Fn(&str) -> Option<String>,
     target: Target,
@@ -195,9 +208,7 @@ pub fn queue_prompt(
             "the agent and the text must not be empty".into(),
         ));
     }
-    let files = files_dir(env).ok_or_else(|| {
-        Error::Setting("neither XDG_RUNTIME_DIR nor HERDR_MATRIX_STATE is set".into())
-    })?;
+    let files = need_files_dir(env)?;
     let at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
@@ -215,6 +226,70 @@ pub fn queue_prompt(
                 Target::Cwd(dir) => Some(dir.to_owned()),
             },
         },
+    )
+}
+
+/// Queues a file for the running bot, which posts it in the chat of the
+/// agent in the pane `HERDR_PANE_ID` names; the path of its entry. In a
+/// confined agent's sandbox, `HERDR_MATRIX_UPLOADS` is the agent's own
+/// queue, which names the agent. The file is read here, in the caller's
+/// process.
+///
+/// # Errors
+/// When neither `HERDR_MATRIX_UPLOADS` nor `HERDR_PANE_ID` is set, when
+/// `path` is not a regular file or is empty, when neither `XDG_CACHE_HOME`
+/// nor `HOME` is set, or when the copy cannot be written.
+pub fn queue_file(
+    env: &dyn Fn(&str) -> Option<String>,
+    path: &Path,
+    caption: &str,
+) -> Result<PathBuf> {
+    let own = env("HERDR_MATRIX_UPLOADS")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    let pane = match own {
+        Some(_) => String::new(),
+        None => env("HERDR_PANE_ID")
+            .filter(|pane| !pane.is_empty())
+            .ok_or_else(|| Error::Refused("not in a herdr pane".into()))?,
+    };
+    let refused = |why: &str| Error::Refused(format!("{}: {why}", path.display()));
+    // Opening a FIFO would wait for a writer
+    if !fs::metadata(path)
+        .map_err(|err| refused(&err.to_string()))?
+        .is_file()
+    {
+        return Err(refused("not a regular file"));
+    }
+    let mut file = fs::File::open(path).map_err(|err| refused(&err.to_string()))?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(refused("not a regular file"));
+    }
+    if meta.len() == 0 {
+        return Err(refused("empty"));
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| refused("not a regular file"))?
+        .to_string_lossy()
+        .into_owned();
+    let dir = match own {
+        Some(dir) => dir,
+        None => need_files_dir(env)?.join("uploads"),
+    };
+    let at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64());
+    inbox::queue_upload(
+        &dir,
+        &Upload {
+            pane,
+            name,
+            caption: Some(caption.to_owned()).filter(|c| !c.is_empty()),
+            at,
+        },
+        &mut file,
     )
 }
 
@@ -263,6 +338,7 @@ mod tests {
             ("HERDR_MATRIX_OWNER", "@kari:example.org".to_owned()),
             ("HERDR_MATRIX_STATE", dir.display().to_string()),
             ("HERDR_MATRIX_NAME", "Claude".to_owned()),
+            ("HOME", dir.display().to_string()),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
@@ -311,14 +387,27 @@ mod tests {
     }
 
     #[test]
-    fn files_go_to_the_runtime_directory() {
+    fn files_go_to_the_cache_directory() {
         let dir = TempDir::new();
-        let env = env(dir.path(), &[]);
-        let s = settings(&|k| env.get(k).cloned()).expect("settings");
-        assert_eq!(s.files, dir.path().join("files"));
-        let env = self::env(dir.path(), &[("XDG_RUNTIME_DIR", "/run/user/1000".into())]);
-        let s = settings(&|k| env.get(k).cloned()).expect("settings");
-        assert_eq!(s.files, Path::new("/run/user/1000/herdr-matrix"));
+        let home = dir.path().join(".cache/herdr-matrix");
+        for (cache, want) in [
+            (None, home.as_path()),
+            (Some(""), home.as_path()),
+            (Some("cache"), home.as_path()),
+            (Some("/c"), Path::new("/c/herdr-matrix")),
+        ] {
+            let extra: Vec<(&str, String)> = cache
+                .map(|c| ("XDG_CACHE_HOME", c.to_owned()))
+                .into_iter()
+                .collect();
+            let env = env(dir.path(), &extra);
+            let s = settings(&|k| env.get(k).cloned()).expect("settings");
+            assert_eq!(s.files, want, "{cache:?}");
+        }
+        let mut env = env(dir.path(), &[]);
+        env.remove("HOME");
+        let err = settings(&|k| env.get(k).cloned()).expect_err("no files directory");
+        assert_eq!(err.to_string(), "neither XDG_CACHE_HOME nor HOME is set");
     }
 
     #[test]
@@ -350,7 +439,7 @@ mod tests {
         assert!(!bot.deps().spawn_prefix);
         assert_eq!(
             bot.deps().inbox.as_deref(),
-            Some(dir.path().join("files/prompts").as_path())
+            Some(dir.path().join(".cache/herdr-matrix/prompts").as_path())
         );
     }
 
@@ -377,6 +466,7 @@ mod tests {
                     name: Some("Kate".into()),
                     prefix: Some(false),
                     avatar: Some("/k.png".into()),
+                    ..AgentSettings::default()
                 },
                 AgentSettings {
                     cwd: "/w/b".into(),
@@ -408,17 +498,49 @@ mod tests {
     }
 
     #[test]
+    fn confined_agent_settings_come_from_a_file() {
+        let dir = TempDir::new();
+        let file = dir.path().join("agents.json");
+        fs::write(
+            &file,
+            r#"[{"cwd": "/w/n", "name": null, "prefix": null, "avatar": null, "kind": "pi",
+                 "sandbox": {"id": "nora", "state": "/s/pi", "uploads": "/c/uploads/nora",
+                             "files": "/c/agents/nora"}}]"#,
+        )
+        .expect("write");
+        let env = env(
+            dir.path(),
+            &[("HERDR_MATRIX_AGENTS", file.display().to_string())],
+        );
+        let s = settings(&|k| env.get(k).cloned()).expect("settings");
+        assert_eq!(s.agents[0].kind, crate::kind::Kind::Pi);
+        assert_eq!(
+            s.agents[0].sandbox,
+            Some(crate::bot::Sandbox {
+                id: "nora".into(),
+                state: "/s/pi".into(),
+                uploads: "/c/uploads/nora".into(),
+                files: "/c/agents/nora".into(),
+            })
+        );
+        fs::write(&file, r#"[{"cwd": "/w/n", "sandbox": {"id": "nora"}}]"#).expect("write");
+        assert!(settings(&|k| env.get(k).cloned()).is_err());
+        fs::write(&file, r#"[{"cwd": "/w/n", "kind": "codex"}]"#).expect("write");
+        assert!(settings(&|k| env.get(k).cloned()).is_err());
+    }
+
+    #[test]
     fn prompt_is_queued_where_the_bot_takes_it() {
         let dir = TempDir::new();
         let run = dir.path().join("run");
         for (env, inbox) in [
             (
-                vec![("XDG_RUNTIME_DIR", run.display().to_string())],
+                vec![("XDG_CACHE_HOME", run.display().to_string())],
                 run.join("herdr-matrix/prompts"),
             ),
             (
-                vec![("HERDR_MATRIX_STATE", dir.path().display().to_string())],
-                dir.path().join("files/prompts"),
+                vec![("HOME", dir.path().display().to_string())],
+                dir.path().join(".cache/herdr-matrix/prompts"),
             ),
         ] {
             let env: HashMap<&str, String> = env.into_iter().collect();
@@ -437,7 +559,7 @@ mod tests {
         }
         let err = queue_prompt(&|_| None, Target::Agent("mail"), "Check it").expect_err("nowhere");
         assert!(matches!(err, Error::Setting(_)), "{err}");
-        let env = HashMap::from([("XDG_RUNTIME_DIR", run.display().to_string())]);
+        let env = HashMap::from([("XDG_CACHE_HOME", run.display().to_string())]);
         for (target, text) in [
             (Target::Agent(""), "Check it"),
             (Target::Agent("mail"), ""),

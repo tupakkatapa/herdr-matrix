@@ -2,9 +2,11 @@
 
 mod chat;
 mod choices;
+mod confined;
 mod contacts;
 mod fakes;
 mod files;
+mod kinds;
 mod limits;
 mod local;
 mod restarts;

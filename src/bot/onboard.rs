@@ -2,6 +2,7 @@
 //! and the bot's name and picture.
 
 use std::fs;
+use std::io::Cursor;
 
 use super::{Bot, To};
 use crate::Result;
@@ -121,7 +122,9 @@ impl Bot {
         if let Some(url) = self.state.avatars.get(&digest) {
             return Ok(url.clone());
         }
-        let url = self.matrix.upload(data, "image/png")?;
+        let url = self
+            .matrix
+            .upload(&mut Cursor::new(data), data.len() as u64, "image/png")?;
         self.state.avatars.insert(digest, url.clone());
         self.save()?;
         Ok(url)

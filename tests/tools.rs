@@ -135,13 +135,13 @@ fn hung_tool_is_named() {
     assert!(started.elapsed() < Duration::from_secs(4));
 }
 
-/// The binary, with `XDG_RUNTIME_DIR` alone set, so it can start no bot;
+/// The binary, with `XDG_CACHE_HOME` alone set, so it can start no bot;
 /// its exit code and what it wrote on stderr.
-fn herdr_matrix(run: &Path, args: &[&str]) -> (Option<i32>, String) {
+fn herdr_matrix(cache: &Path, args: &[&str]) -> (Option<i32>, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_herdr-matrix"))
         .args(args)
         .env_clear()
-        .env("XDG_RUNTIME_DIR", run)
+        .env("XDG_CACHE_HOME", cache)
         .output()
         .expect("ran");
     (
@@ -206,6 +206,158 @@ fn prompt_command_queues_by_cwd() {
     let (code, err) = herdr_matrix(dir.path(), &["prompt", "--cwd", "", "hi"]);
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(fs::read_dir(&inbox).expect("list").count(), 2);
+}
+
+/// `herdr-matrix send` in a pane, with `XDG_CACHE_HOME` set; its exit
+/// code and what it wrote on stderr.
+fn send(cache: &Path, pane: Option<&str>, args: &[&str]) -> (Option<i32>, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-matrix"));
+    command
+        .arg("send")
+        .args(args)
+        .env_clear()
+        .env("XDG_CACHE_HOME", cache);
+    if let Some(pane) = pane {
+        command.env("HERDR_PANE_ID", pane);
+    }
+    let out = command.output().expect("ran");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn send_command_queues_a_copy() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let uploads = dir.path().join("herdr-matrix/uploads");
+    let shot = dir.path().join("shot.png");
+    fs::write(&shot, "picture").expect("write");
+    let link = dir.path().join("link.png");
+    std::os::unix::fs::symlink(&shot, &link).expect("symlink");
+    let path = shot.display().to_string();
+    assert_eq!(
+        send(dir.path(), Some("w1:p2"), &[&path, "The", " login page"]),
+        (Some(0), String::new())
+    );
+    let link = link.display().to_string();
+    assert_eq!(
+        send(dir.path(), Some("w1:p2"), &[&link]),
+        (Some(0), String::new())
+    );
+    let paths: Vec<PathBuf> = fs::read_dir(&uploads)
+        .expect("an upload directory")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert_eq!(paths.len(), 4, "{paths:?}");
+    let mut entries = Vec::new();
+    for path in paths
+        .iter()
+        .filter(|p| p.extension() == Some("json".as_ref()))
+    {
+        let entry: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read")).expect("JSON");
+        let data = path.with_extension("data");
+        assert_eq!(fs::read(data).expect("a copy"), b"picture");
+        entries.push((
+            entry["pane"].clone(),
+            entry["name"].clone(),
+            entry["caption"].clone(),
+        ));
+    }
+    entries.sort_by_key(|e| e.1.to_string());
+    assert_eq!(
+        entries,
+        [
+            ("w1:p2".into(), "link.png".into(), serde_json::Value::Null),
+            ("w1:p2".into(), "shot.png".into(), "The  login page".into()),
+        ]
+    );
+}
+
+#[test]
+fn send_command_in_a_sandbox_queues_in_the_agents_queue() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let own = dir.path().join("uploads/nora");
+    let shot = dir.path().join("shot.png");
+    fs::write(&shot, "picture").expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-matrix"))
+        .args(["send", &shot.display().to_string(), "Look"])
+        .env_clear()
+        .env("HERDR_MATRIX_UPLOADS", &own)
+        .output()
+        .expect("ran");
+    assert_eq!(
+        (out.status.code(), String::from_utf8_lossy(&out.stderr)),
+        (Some(0), "".into())
+    );
+    let entry = fs::read_dir(&own)
+        .expect("the agent's queue")
+        .map(|e| e.expect("entry").path())
+        .find(|p| p.extension() == Some("json".as_ref()))
+        .expect("an entry");
+    let entry: serde_json::Value =
+        serde_json::from_slice(&fs::read(&entry).expect("read")).expect("JSON");
+    assert_eq!(
+        (&entry["pane"], &entry["caption"]),
+        (&"".into(), &"Look".into())
+    );
+    assert!(!dir.path().join("herdr-matrix").exists());
+}
+
+#[test]
+fn send_command_refuses() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let empty = dir.path().join("empty.txt");
+    fs::write(&empty, "").expect("write");
+    let shot = dir.path().join("shot.png");
+    fs::write(&shot, "picture").expect("write");
+    let fifo = dir.path().join("fifo");
+    let _ = Command::new("mkfifo").arg(&fifo).status();
+    let shown = |p: &Path| p.display().to_string();
+    let mut refusals = vec![
+        (None, shown(&shot), "not in a herdr pane".to_owned()),
+        (Some(""), shown(&shot), "not in a herdr pane".to_owned()),
+        (
+            Some("w1:p2"),
+            shown(dir.path()),
+            format!("{}: not a regular file", dir.path().display()),
+        ),
+        (
+            Some("w1:p2"),
+            shown(&empty),
+            format!("{}: empty", empty.display()),
+        ),
+    ];
+    if fifo.exists() {
+        refusals.push((
+            Some("w1:p2"),
+            shown(&fifo),
+            format!("{}: not a regular file", fifo.display()),
+        ));
+    }
+    for (pane, path, want) in refusals {
+        assert_eq!(
+            send(dir.path(), pane, &[&path]),
+            (Some(1), format!("{want}\n")),
+            "{path}"
+        );
+    }
+    let missing = dir.path().join("missing");
+    let (code, err) = send(dir.path(), Some("w1:p2"), &[&shown(&missing)]);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with(&format!("{}: ", missing.display())),
+        "{err}"
+    );
+    assert_eq!(err.lines().count(), 1);
+    let (code, err) = send(dir.path(), Some("w1:p2"), &[]);
+    assert_eq!(code, Some(2));
+    assert!(err.starts_with("usage: herdr-matrix"), "{err}");
+    assert!(!dir.path().join("herdr-matrix/uploads").exists());
 }
 
 #[test]

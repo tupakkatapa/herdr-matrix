@@ -836,7 +836,7 @@ fn default_answer_reads_the_agents_transcript() {
             .collect::<String>(),
     )
     .expect("write");
-    t.bot.deps_mut().answer = Box::new(move |a| herdr_matrix::herdr::claude_turn(a, Some(&home)));
+    t.bot.deps_mut().answer = Box::new(move |a| herdr_matrix::kind::claude::turn(a, Some(&home)));
     t.working_then("idle", "wA:p1");
     assert_eq!(t.new_msgs(), ["Hi there."]);
 }

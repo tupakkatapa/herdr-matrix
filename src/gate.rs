@@ -35,13 +35,17 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 
 pub const USAGE: &str = "usage: herdr-matrix chats rooms | read <room> [count] [--since T] [--until T] [--from END] | search <room> <words>... [--since T] [--until T] [--context N] | send <room> <text>...; T is <n>h, <n>d, <n>w, YYYY-MM-DD or YYYY-MM-DDTHH:MM[:SS][Z], in UTC";
 
-/// Which rooms the gate serves.
+/// Which rooms and commands the gate serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rules {
     /// Localpart prefixes of bridged contacts, as `signal` of `@signal_…`
     pub bridges: Vec<String>,
     /// Localpart of the bot, as `herdr` of `@herdr` and `@herdr_…`
     pub bot: String,
+    /// The commands the caller may give; every one without a list
+    pub commands: Option<Vec<String>>,
+    /// The bridged chats the caller sees; every one without a list
+    pub rooms: Option<Vec<String>>,
 }
 
 /// A time range, in milliseconds since the epoch.
@@ -114,6 +118,31 @@ impl Rules {
                 })
         });
         bridged && !bot
+    }
+
+    fn lets(&self, command: &str) -> bool {
+        self.commands
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|c| c == command))
+    }
+
+    fn shows(&self, room: &str) -> bool {
+        self.rooms
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|r| r == room))
+    }
+}
+
+impl Request {
+    /// The command, as `herdr-matrix chats` takes it.
+    #[must_use]
+    pub fn command(&self) -> &'static str {
+        match self {
+            Self::Rooms => "rooms",
+            Self::Read { .. } => "read",
+            Self::Search { .. } => "search",
+            Self::Send { .. } => "send",
+        }
     }
 }
 
@@ -222,7 +251,7 @@ impl<M: Matrix> Gate<M> {
             .flatten()
             .filter_map(member)
             .collect();
-        Ok(self.rules.serves(&members, &self.server))
+        Ok(self.rules.serves(&members, &self.server) && self.rules.shows(room))
     }
 
     fn check(&mut self, room: &str) -> Result<()> {
@@ -360,9 +389,13 @@ impl<M: Matrix> Gate<M> {
     /// The answer to a request.
     ///
     /// # Errors
-    /// When the room is not a bridged chat, when the gate can read none of
-    /// its messages, or when a request fails.
+    /// When the command is not allowed, when the room is not a bridged
+    /// chat, when the gate can read none of its messages, or when a request
+    /// fails.
     pub fn run(&mut self, request: &Request) -> Result<Value> {
+        if !self.rules.lets(request.command()) {
+            return Err(Error::Refused("not allowed for this agent".into()));
+        }
         match request {
             Request::Rooms => self.rooms(),
             Request::Read {
@@ -607,7 +640,8 @@ fn now_ms() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// The homeserver and the rules, from the gate's unit.
+/// The homeserver and the rules, from the gate's unit; the unit of a
+/// confined agent's socket sets the lists of commands and rooms.
 fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<(String, Rules)> {
     let need = |name: &str| {
         env(name)
@@ -625,7 +659,17 @@ fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<(String, Rules)> {
         .map(str::to_owned)
         .collect();
     let bot = need("HERDR_MATRIX_GATE_BOT")?.trim().to_owned();
-    Ok((homeserver, Rules { bridges, bot }))
+    let list =
+        |name: &str| env(name).map(|value| value.split_whitespace().map(str::to_owned).collect());
+    Ok((
+        homeserver,
+        Rules {
+            bridges,
+            bot,
+            commands: list("HERDR_MATRIX_GATE_COMMANDS"),
+            rooms: list("HERDR_MATRIX_GATE_ROOMS"),
+        },
+    ))
 }
 
 /// The owner's token: the credential `token` that systemd passes.
@@ -701,6 +745,7 @@ pub fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::matrix::Source;
 
     const NOW: i64 = 1_800_000_000_000;
     const ME: &str = "@me:x";
@@ -711,6 +756,8 @@ mod tests {
                 .map(str::to_owned)
                 .to_vec(),
             bot: "herdr".into(),
+            commands: None,
+            rooms: None,
         }
     }
 
@@ -802,11 +849,15 @@ mod tests {
             Ok(json!({"chunk": chunk, "end": (at + chunk.len()).to_string()}))
         }
 
-        fn upload(&mut self, _: &[u8], _: &str) -> Result<String> {
+        fn upload(&mut self, _: &mut dyn Source, _: u64, _: &str) -> Result<String> {
             unreachable!()
         }
 
-        fn download(&mut self, _: &str) -> Result<Vec<u8>> {
+        fn download(&mut self, _: &str, _: &mut dyn std::io::Write) -> Result<()> {
+            unreachable!()
+        }
+
+        fn upload_limit(&mut self) -> Result<Option<u64>> {
             unreachable!()
         }
 
@@ -1118,6 +1169,42 @@ mod tests {
     }
 
     #[test]
+    fn commands_outside_the_list_are_refused() {
+        let mut room = room();
+        room.rules.commands = Some(vec!["rooms".into(), "read".into(), "search".into()]);
+        let err = answer(&mut room, &["send", "!r", "hi"]).expect_err("refused");
+        assert_eq!(err.to_string(), "not allowed for this agent");
+        assert!(room.matrix.sent.is_empty());
+        answer(&mut room, &["read", "!r"]).expect("read");
+        answer(&mut room, &["search", "!r", "m1"]).expect("search");
+        room.rules.commands = Some(Vec::new());
+        let err = answer(&mut room, &["rooms"]).expect_err("refused");
+        assert_eq!(err.to_string(), "not allowed for this agent");
+    }
+
+    #[test]
+    fn rooms_outside_the_list_do_not_exist() {
+        let mut gate = fake(Vec::new());
+        gate.matrix.rooms.push(("!n", BRIDGED.to_vec()));
+        gate.rules.rooms = Some(vec!["!n".into(), "!h".into()]);
+        assert_eq!(
+            answer(&mut gate, &["rooms"]).expect("rooms"),
+            json!([{"room": "!n", "name": "!n"}])
+        );
+        for argv in [
+            &["read", "!r"][..],
+            &["search", "!r", "x"],
+            &["send", "!r", "x"],
+            &["send", "!h", "x"],
+        ] {
+            let err = answer(&mut gate, argv).expect_err("refused");
+            assert_eq!(err.to_string(), "not a bridged chat", "{argv:?}");
+        }
+        assert!(gate.matrix.sent.is_empty());
+        answer(&mut gate, &["send", "!n", "x"]).expect("sent");
+    }
+
+    #[test]
     fn bad_arguments_name_the_usage() {
         let mut room = room();
         for argv in [
@@ -1203,7 +1290,22 @@ mod tests {
                 Rules {
                     bridges: vec!["signal".into(), "whatsapp".into()],
                     bot: "herdr".into(),
+                    commands: None,
+                    rooms: None,
                 }
+            )
+        );
+        let agent = |name: &str| match name {
+            "HERDR_MATRIX_GATE_COMMANDS" => Some("rooms read  search".to_owned()),
+            "HERDR_MATRIX_GATE_ROOMS" => Some("!a:x !b:x".to_owned()),
+            other => local(other),
+        };
+        let (_, rules) = settings(&agent).expect("settings");
+        assert_eq!(
+            (rules.commands, rules.rooms),
+            (
+                Some(vec!["rooms".into(), "read".into(), "search".into()]),
+                Some(vec!["!a:x".into(), "!b:x".into()])
             )
         );
         let dir = crate::testutil::TempDir::new();

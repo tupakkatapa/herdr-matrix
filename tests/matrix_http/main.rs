@@ -4,6 +4,7 @@ use herdr_matrix::Error;
 use herdr_matrix::matrix::{Http, Matrix as _};
 use serde_json::json;
 use server::Server;
+use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,7 +67,9 @@ fn upload() {
     let server = server(Arc::default());
     let mut matrix = Http::new(&server.url, "tok");
     assert_eq!(
-        matrix.upload(b"png", "image/png").expect("upload"),
+        matrix
+            .upload(&mut Cursor::new(b"png"), 3, "image/png")
+            .expect("upload"),
         "mxc://s/u"
     );
     let got = server.last();
@@ -75,32 +78,82 @@ fn upload() {
         ("POST", "/_matrix/media/v3/upload", &b"png"[..])
     );
     assert_eq!(got.headers["content-type"], "image/png");
+    assert_eq!(got.headers["content-length"], "3");
     assert_eq!(got.headers["authorization"], "Bearer tok");
+}
+
+#[test]
+fn rate_limited_upload_is_sent_again_whole() {
+    let answers = Arc::new(Mutex::new(vec![
+        (
+            429,
+            br#"{"errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 10}"#.to_vec(),
+        ),
+        (200, br#"{"content_uri": "mxc://s/u"}"#.to_vec()),
+    ]));
+    let server = Server::new(move |_| {
+        let (code, body) = answers.lock().expect("lock").remove(0);
+        (code, "application/json".into(), body)
+    });
+    let mut matrix = Http::new(&server.url, "tok");
+    let data = vec![7; 300_000];
+    assert_eq!(
+        matrix
+            .upload(&mut Cursor::new(&data), 300_000, "application/octet-stream")
+            .expect("upload"),
+        "mxc://s/u"
+    );
+    let requests = server.requests.lock().expect("lock");
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.body == data));
+}
+
+#[test]
+fn upload_limit_is_the_homeservers() {
+    let answers = Arc::new(Mutex::new(vec![
+        br#"{"m.upload.size": 52428800}"#.to_vec(),
+        b"{}".to_vec(),
+    ]));
+    let server = Server::new(move |_| {
+        (
+            200,
+            "application/json".into(),
+            answers.lock().expect("lock").remove(0),
+        )
+    });
+    let mut matrix = Http::new(&server.url, "tok");
+    assert_eq!(matrix.upload_limit().expect("limit"), Some(52_428_800));
+    let got = server.last();
+    assert_eq!(
+        (got.method.as_str(), got.path.as_str()),
+        ("GET", "/_matrix/client/v1/media/config")
+    );
+    assert_eq!(got.headers["authorization"], "Bearer tok");
+    assert_eq!(matrix.upload_limit().expect("limit"), None);
 }
 
 #[test]
 fn download() {
     let server = server(Arc::new(Mutex::new(b"picture".to_vec())));
     let mut matrix = Http::new(&server.url, "tok");
-    assert_eq!(
-        matrix.download("mxc://ex.org/a/b").expect("download"),
-        b"picture"
-    );
+    let mut out = Vec::new();
+    matrix
+        .download("mxc://ex.org/a/b", &mut out)
+        .expect("download");
+    assert_eq!(out, b"picture");
     let got = server.last();
     assert_eq!(got.path, "/_matrix/client/v1/media/download/ex.org/a%2Fb");
     assert_eq!(got.headers["authorization"], "Bearer tok");
 }
 
 #[test]
-fn download_is_capped() {
-    let file = Arc::new(Mutex::new(b"picture".to_vec()));
-    let server = server(file.clone());
+fn download_has_no_size_of_its_own() {
+    let file = vec![1; 26 << 20];
+    let server = server(Arc::new(Mutex::new(file.clone())));
     let mut matrix = Http::new(&server.url, "tok");
-    matrix.file_max = 7;
-    assert_eq!(matrix.download("mxc://s/m").expect("download"), b"picture");
-    file.lock().expect("lock").push(b'!');
-    let err = matrix.download("mxc://s/m").expect_err("too large");
-    assert!(matches!(err, Error::Refused(_)));
+    let mut out = Vec::new();
+    matrix.download("mxc://s/m", &mut out).expect("download");
+    assert!(out == file);
 }
 
 #[test]
@@ -201,7 +254,9 @@ fn revoked_token_says_what_to_check() {
 fn upload_without_a_uri_is_malformed() {
     let server = answering(200, "application/json", b"{}");
     let mut matrix = Http::new(&server.url, "tok");
-    let err = matrix.upload(b"png", "image/png").expect_err("no uri");
+    let err = matrix
+        .upload(&mut Cursor::new(b"png"), 3, "image/png")
+        .expect_err("no uri");
     assert!(matches!(err, Error::Malformed(_)), "{err:?}");
 }
 
@@ -209,7 +264,9 @@ fn upload_without_a_uri_is_malformed() {
 fn missing_download_is_an_http_error() {
     let server = answering(404, "application/json", br#"{"errcode": "M_NOT_FOUND"}"#);
     let mut matrix = Http::new(&server.url, "tok");
-    let err = matrix.download("mxc://s/m").expect_err("404");
+    let err = matrix
+        .download("mxc://s/m", &mut Vec::new())
+        .expect_err("404");
     assert!(matches!(err, Error::Http { status: 404, .. }), "{err:?}");
 }
 
@@ -217,12 +274,14 @@ fn missing_download_is_an_http_error() {
 fn odd_mxc_paths_are_quoted() {
     let server = server(Arc::new(Mutex::new(b"x".to_vec())));
     let mut matrix = Http::new(&server.url, "tok");
-    matrix.download("mxc://ex.org:8448/id").expect("download");
+    matrix
+        .download("mxc://ex.org:8448/id", &mut Vec::new())
+        .expect("download");
     assert_eq!(
         server.last().path,
         "/_matrix/client/v1/media/download/ex.org%3A8448/id"
     );
-    matrix.download("bare").expect("download");
+    matrix.download("bare", &mut Vec::new()).expect("download");
     assert_eq!(
         server.last().path,
         "/_matrix/client/v1/media/download/bare/"

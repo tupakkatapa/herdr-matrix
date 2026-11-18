@@ -17,7 +17,8 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::herdr::{self, Agent, Herdr, RunHerdr, Status, Turn, claude_turn};
+use crate::herdr::{self, Agent, Herdr, RunHerdr, Status, Turn};
+use crate::kind::{self, Kind};
 use crate::matrix::{Api as _, As, Matrix};
 use crate::render::{EVENT_MAX, chunks, cut, escape, md, screen_size, size};
 use crate::state::{Away, Chat, State, Store};
@@ -44,6 +45,8 @@ pub const HOLD: Duration = Duration::from_secs(20);
 pub const STALE: Duration = Duration::from_mins(10);
 /// How long a prompt waits for its answer while the agent does nothing
 pub const PENDING_TTL: Duration = Duration::from_mins(10);
+/// How long files from the chat wait for more for the same agent
+pub const FILES_WAIT: Duration = Duration::from_secs(5);
 
 /// What a recording says
 pub type Transcribe = Box<dyn Fn(&Path) -> Result<String>>;
@@ -55,10 +58,26 @@ pub type Answer = Box<dyn Fn(&Agent) -> Option<Turn>>;
 #[serde(default)]
 pub struct AgentSettings {
     pub cwd: String,
+    /// What `!new` starts there, and what runs in its sandbox
+    pub kind: Kind,
     pub name: Option<String>,
     /// The bot's name before the agent's, in place of `spawn_prefix`
     pub prefix: Option<bool>,
     pub avatar: Option<PathBuf>,
+    pub sandbox: Option<Sandbox>,
+}
+
+/// The places of a confined agent, which `herdr-matrix-agent-<id>` binds
+/// into its sandbox. Everything the agent writes there is untrusted.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct Sandbox {
+    pub id: String,
+    /// Its state directory, with its sessions
+    pub state: PathBuf,
+    /// Its queue of `herdr-matrix send`
+    pub uploads: PathBuf,
+    /// Files from the chat for it, read-only inside
+    pub files: PathBuf,
 }
 
 /// What the bot works with; the tests swap each part.
@@ -85,6 +104,8 @@ pub struct Deps {
     pub spawn_prefix: bool,
     /// Where `herdr-matrix prompt` queues prompts from the machine
     pub inbox: Option<PathBuf>,
+    /// Where `herdr-matrix send` queues files of the agents
+    pub uploads: Option<PathBuf>,
     pub agents: Vec<AgentSettings>,
 }
 
@@ -99,7 +120,7 @@ impl Default for Deps {
                     .duration_since(UNIX_EPOCH)
                     .map_or(0.0, |d| d.as_secs_f64())
             }),
-            answer: Box::new(|a| claude_turn(a, None)),
+            answer: Box::new(|a| kind::turn(a, None)),
             transcribe: None,
             log: Box::new(|line| eprintln!("{line}")),
             files: std::env::temp_dir().join("herdr-matrix"),
@@ -109,6 +130,7 @@ impl Default for Deps {
             spawn_avatar: None,
             spawn_prefix: true,
             inbox: None,
+            uploads: None,
             agents: Vec::new(),
         }
     }
@@ -233,6 +255,8 @@ pub struct Bot {
     txns: IndexMap<String, String>,
     /// The sha256 of each contact picture read in this run, by its path
     digests: HashMap<PathBuf, String>,
+    /// Files from the chat that wait for more
+    held_files: Vec<inbound::Held>,
 }
 
 impl Bot {
@@ -254,6 +278,7 @@ impl Bot {
             profiled: false,
             txns: IndexMap::new(),
             digests: HashMap::new(),
+            held_files: Vec::new(),
         }
     }
 
@@ -390,9 +415,9 @@ impl Bot {
         }
     }
 
-    /// The name and picture until they are set, one sync, and a herdr poll
-    /// when one is due, so a homeserver that answers /sync at once does not
-    /// spin herdr.
+    /// The name and picture until they are set, one sync, the files from
+    /// the chat that no more joined, and a herdr poll when one is due, so a
+    /// homeserver that answers /sync at once does not spin herdr.
     ///
     /// # Errors
     /// When Matrix or herdr fails.
@@ -404,7 +429,9 @@ impl Bot {
             }
         }
         self.onboard()?;
-        self.sync()?;
+        let synced = self.sync();
+        self.hand_over_files();
+        synced?;
         if let Err(err) = self.local() {
             self.log(&format!("error: prompts: {err}"));
         }
@@ -537,8 +564,20 @@ impl Bot {
         self.say(&body.join("\n\n"), if how.quiet { to.quiet() } else { to })
     }
 
+    /// What the agent did since the last prompt; a confined agent cannot
+    /// tell herdr its session, so its newest session file is the one.
     fn turn(&self, a: &Agent) -> Turn {
-        (self.deps.answer)(a).unwrap_or_default()
+        let settings = self.agent_settings(a);
+        match settings.and_then(|s| s.sandbox.as_ref().map(|sandbox| (&s.kind, sandbox))) {
+            Some((kind, sandbox)) => kind::confined_turn(kind, &sandbox.state),
+            None => (self.deps.answer)(a),
+        }
+        .unwrap_or_default()
+    }
+
+    /// The sandbox of the agent working in the directory of `a`.
+    fn sandbox(&self, a: &Agent) -> Option<&Sandbox> {
+        self.agent_settings(a)?.sandbox.as_ref()
     }
 }
 

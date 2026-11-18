@@ -1,19 +1,20 @@
 //! The Matrix client-server API.
 
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
-use ureq::Body;
 use ureq::http::{Request, Response};
+use ureq::{AsSendBody, Body, SendBody};
 
 use crate::json::key_str;
 use crate::{Error, Result};
 
 /// How long a request may take, unless it says otherwise
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(1);
+/// How long a download or an upload may take
+pub const TRANSFER_TIMEOUT: Duration = Duration::from_mins(1);
 /// How long the homeserver holds a sync open for new events
 pub const SYNC_WAIT: Duration = Duration::from_secs(3);
 /// How long a typing notice lasts unless renewed
@@ -22,8 +23,11 @@ const TYPING_TIMEOUT: Duration = Duration::from_secs(10);
 /// waited out
 const RATE_LIMIT_WAIT: Duration = Duration::from_secs(1);
 const RATE_LIMIT_WAIT_MAX: Duration = Duration::from_secs(30);
-/// Bytes of a download at most
-pub const FILE_MAX: usize = 25 * 1024 * 1024;
+
+/// What an upload reads, from the start again when it is sent again.
+pub trait Source: Read + Seek {}
+
+impl<T: Read + Seek> Source for T {}
 
 pub trait Matrix {
     /// # Errors
@@ -36,12 +40,21 @@ pub trait Matrix {
         query: &[(&str, &str)],
         timeout: Duration,
     ) -> Result<Value>;
+    /// Uploads the `len` bytes of `data`; their mxc URI.
+    ///
     /// # Errors
     /// When the upload fails.
-    fn upload(&mut self, data: &[u8], content_type: &str) -> Result<String>;
+    fn upload(&mut self, data: &mut dyn Source, len: u64, content_type: &str) -> Result<String>;
+    /// Writes a file of the homeserver to `out` as it comes.
+    ///
     /// # Errors
-    /// When the download fails or is too large.
-    fn download(&mut self, mxc: &str) -> Result<Vec<u8>>;
+    /// When the download or a write fails.
+    fn download(&mut self, mxc: &str, out: &mut dyn io::Write) -> Result<()>;
+    /// The size of the largest upload the homeserver takes, when it says.
+    ///
+    /// # Errors
+    /// When the request fails.
+    fn upload_limit(&mut self) -> Result<Option<u64>>;
     fn next_txn(&mut self) -> String;
 }
 
@@ -50,8 +63,6 @@ pub struct Http {
     token: String,
     txn: u128,
     agent: ureq::Agent,
-    /// Bytes of a download at most
-    pub file_max: usize,
 }
 
 impl Http {
@@ -64,38 +75,17 @@ impl Http {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis()),
             agent: agent(),
-            file_max: FILE_MAX,
         }
     }
 
-    /// A request; one the homeserver rate-limits is sent again once, after
-    /// the wait it asks for.
-    fn open(
+    /// A request with a body of `len` bytes, else of the size `body` has.
+    fn open<B: AsSendBody>(
         &self,
-        url: &str,
-        data: Option<Vec<u8>>,
         method: &str,
-        content_type: Option<&str>,
-        timeout: Duration,
-    ) -> Result<Response<Body>> {
-        match self.open_once(url, data.clone(), method, content_type, timeout) {
-            Err(err) => match retry_after(&err) {
-                Some(wait) => {
-                    std::thread::sleep(wait);
-                    self.open_once(url, data, method, content_type, timeout)
-                }
-                None => Err(err),
-            },
-            ok => ok,
-        }
-    }
-
-    fn open_once(
-        &self,
         url: &str,
-        data: Option<Vec<u8>>,
-        method: &str,
         content_type: Option<&str>,
+        body: B,
+        len: Option<u64>,
         timeout: Duration,
     ) -> Result<Response<Body>> {
         let mut request = Request::builder()
@@ -105,8 +95,11 @@ impl Http {
         if let Some(kind) = content_type {
             request = request.header("Content-Type", kind);
         }
+        if let Some(len) = len {
+            request = request.header("Content-Length", len);
+        }
         let request = request
-            .body(data.unwrap_or_default())
+            .body(body)
             .map_err(|err| Error::Setting(err.to_string()))?;
         let request = self
             .agent
@@ -114,6 +107,21 @@ impl Http {
             .timeout_global(Some(timeout))
             .build();
         checked(self.agent.run(request))
+    }
+}
+
+/// A request; one the homeserver rate-limits is sent again once, after the
+/// wait it asks for.
+fn retried(mut send: impl FnMut() -> Result<Response<Body>>) -> Result<Response<Body>> {
+    match send() {
+        Err(err) => match retry_after(&err) {
+            Some(wait) => {
+                std::thread::sleep(wait);
+                send()
+            }
+            None => Err(err),
+        },
+        ok => ok,
     }
 }
 
@@ -184,23 +192,37 @@ impl Matrix for Http {
             url.push('?');
             url.push_str(&urlencode(query));
         }
-        let data = body.map(|b| b.to_string().into_bytes());
-        json(self.open(&url, data, method, Some("application/json"), timeout)?)
+        let data = body.map(|b| b.to_string().into_bytes()).unwrap_or_default();
+        json(retried(|| {
+            self.open(
+                method,
+                &url,
+                Some("application/json"),
+                data.as_slice(),
+                None,
+                timeout,
+            )
+        })?)
     }
 
-    fn upload(&mut self, data: &[u8], content_type: &str) -> Result<String> {
+    fn upload(&mut self, data: &mut dyn Source, len: u64, content_type: &str) -> Result<String> {
         let url = format!("{}/media/v3/upload", self.root);
-        let resp = json(self.open(
-            &url,
-            Some(data.to_vec()),
-            "POST",
-            Some(content_type),
-            DEFAULT_TIMEOUT,
-        )?)?;
+        let start = data.stream_position()?;
+        let resp = json(retried(|| {
+            data.seek(SeekFrom::Start(start))?;
+            self.open(
+                "POST",
+                &url,
+                Some(content_type),
+                SendBody::from_reader(&mut *data),
+                Some(len),
+                TRANSFER_TIMEOUT,
+            )
+        })?)?;
         Ok(key_str(&resp, "content_uri")?.to_owned())
     }
 
-    fn download(&mut self, mxc: &str) -> Result<Vec<u8>> {
+    fn download(&mut self, mxc: &str, out: &mut dyn io::Write) -> Result<()> {
         let rest = mxc.strip_prefix("mxc://").unwrap_or(mxc);
         let (server, media) = rest.split_once('/').unwrap_or((rest, ""));
         let url = format!(
@@ -209,20 +231,18 @@ impl Matrix for Http {
             quote(server),
             quote(media)
         );
-        let mut response = self.open(&url, None, "GET", None, DOWNLOAD_TIMEOUT)?;
-        let mut data = Vec::new();
-        response
-            .body_mut()
-            .as_reader()
-            .take(self.file_max as u64 + 1)
-            .read_to_end(&mut data)?;
-        if data.len() > self.file_max {
-            return Err(Error::Refused(format!(
-                "the file is larger than {} MB",
-                self.file_max >> 20
-            )));
-        }
-        Ok(data)
+        let mut response =
+            retried(|| self.open("GET", &url, None, &b""[..], None, TRANSFER_TIMEOUT))?;
+        io::copy(&mut response.body_mut().as_reader(), out)?;
+        Ok(())
+    }
+
+    fn upload_limit(&mut self) -> Result<Option<u64>> {
+        let url = format!("{}/client/v1/media/config", self.root);
+        let resp = json(retried(|| {
+            self.open("GET", &url, None, &b""[..], None, DEFAULT_TIMEOUT)
+        })?)?;
+        Ok(resp.get("m.upload.size").and_then(Value::as_u64))
     }
 
     fn next_txn(&mut self) -> String {
@@ -343,7 +363,7 @@ impl Inbound {
                 };
                 match text("msgtype")? {
                     "m.text" => What::Text(unquoted(body, relates)),
-                    "m.image" | "m.file" => What::File(media()),
+                    "m.image" | "m.file" | "m.video" => What::File(media()),
                     "m.audio" => What::Voice(media()),
                     _ => return None,
                 }
@@ -758,6 +778,23 @@ mod tests {
                 assert_eq!(decode(&quoted), text);
             }
         }
+    }
+
+    #[test]
+    fn video_is_a_file() {
+        let ev = serde_json::json!({"type": "m.room.message", "sender": "@o:e.org",
+            "event_id": "$v", "origin_server_ts": 2000,
+            "content": {"msgtype": "m.video", "body": "clip.mp4", "url": "mxc://e.org/v"}});
+        let parsed = Inbound::parse(&ev, "@o:e.org").expect("a message");
+        assert_eq!(
+            parsed.what,
+            What::File(Media {
+                url: Some("mxc://e.org/v".into()),
+                name: "clip.mp4".into(),
+                body: "clip.mp4".into(),
+            })
+        );
+        assert_eq!((parsed.id.as_deref(), parsed.ts), (Some("$v"), 2.0));
     }
 
     #[test]

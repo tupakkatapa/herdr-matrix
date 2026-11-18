@@ -65,7 +65,7 @@ impl Bot {
     }
 
     /// The settings of the agent working in the directory of `a`.
-    fn agent_settings(&self, a: &Agent) -> Option<&AgentSettings> {
+    pub(super) fn agent_settings(&self, a: &Agent) -> Option<&AgentSettings> {
         let cwd = a.cwd.as_deref()?;
         self.deps.agents.iter().find(|s| same_dir(&s.cwd, cwd))
     }

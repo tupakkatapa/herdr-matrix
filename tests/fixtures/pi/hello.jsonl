@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"01a1efd7-2cca-77ea-a250-51c614abf88f","timestamp":"2026-11-18T18:06:58.762Z","cwd":"/home/u/proj"}
+{"type":"model_change","id":"5ec3d1d1","parentId":null,"timestamp":"2026-11-18T18:06:58.770Z","provider":"stub","modelId":"stub"}
+{"type":"thinking_level_change","id":"0afdfb6d","parentId":"5ec3d1d1","timestamp":"2026-11-18T18:06:58.770Z","thinkingLevel":"off"}
+{"type":"message","id":"f5426a8c","parentId":"0afdfb6d","timestamp":"2026-11-18T18:06:58.776Z","message":{"role":"user","content":[{"type":"text","text":"Say hi"}],"timestamp":1795025218776}}
+{"type":"message","id":"76292d00","parentId":"f5426a8c","timestamp":"2026-11-18T18:06:58.833Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi there."}],"api":"openai-completions","provider":"stub","model":"stub","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1795025218807,"responseId":"c1"}}

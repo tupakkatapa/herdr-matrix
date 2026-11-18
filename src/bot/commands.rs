@@ -1,7 +1,7 @@
 //! The owner's `!` commands.
 
 use super::contacts::Why;
-use super::{Bot, Post, SCREEN_LINES, SCREEN_MAX, To};
+use super::{Bot, Post, SCREEN_LINES, SCREEN_MAX, To, same_dir};
 use crate::Result;
 use crate::commands::{Cmd, HELP, Place, command, contact, helps};
 use crate::files;
@@ -225,19 +225,19 @@ impl Bot {
         let (head, shown) = match (query, dirs.len()) {
             (Some(_), 1) => (None, Vec::new()),
             (None, _) => (
-                Some("Start Claude in which folder?".to_owned()),
+                Some("Start an agent in which folder?".to_owned()),
                 dirs.clone(),
             ),
             (Some(q), 0) => (
                 Some(format!(
-                    "No folder under {} matches \"{q}\". Start Claude in which one?",
+                    "No folder under {} matches \"{q}\". Start an agent in which one?",
                     self.deps.workspace.display()
                 )),
                 files::folders(&self.deps.workspace, None),
             ),
             (Some(q), n) => (
                 Some(format!(
-                    "\"{q}\" matches {n} folders. Start Claude in which one?"
+                    "\"{q}\" matches {n} folders. Start an agent in which one?"
                 )),
                 dirs.clone(),
             ),
@@ -272,9 +272,16 @@ impl Bot {
             return Ok(());
         }
         let label = path.rsplit('/').next().unwrap_or_default().to_owned();
+        let settings = self.deps.agents.iter().find(|s| same_dir(&s.cwd, path));
+        let kind = settings.map(|s| s.kind.clone()).unwrap_or_default();
+        // The shell left after a confined agent would not be confined
+        let command = settings.and_then(|s| s.sandbox.as_ref()).map_or_else(
+            || kind.program().to_owned(),
+            |s| format!("exec herdr-matrix-agent-{}", s.id),
+        );
         let herdr = self.deps.herdr.as_mut();
         let pane = herdr::create_workspace(herdr, path, &label)?;
-        herdr::run_in_pane(herdr, &pane, "claude")?;
+        herdr::run_in_pane(herdr, &pane, &command)?;
         self.state.attached = Some(pane.clone());
         self.save()?;
         self.nick(Some(&label))?;
@@ -287,7 +294,7 @@ impl Bot {
             },
         )?;
         self.say(
-            &format!("Started Claude in {path}. This chat is attached to it."),
+            &format!("Started {kind} in {path}. This chat is attached to it."),
             To::default(),
         )?;
         Ok(())

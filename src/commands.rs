@@ -131,7 +131,7 @@ pub const COMMANDS: [Command; 12] = [
         cmd: Cmd::New,
         name: "new",
         spoken: Some(".*"),
-        main: Some("!new <folder> - start Claude there"),
+        main: Some("!new <folder> - start an agent there"),
         contact: None,
     },
     Command {

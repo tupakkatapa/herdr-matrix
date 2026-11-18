@@ -1,9 +1,7 @@
-//! herdr and its agents: the CLI, attached clients and Claude's transcripts.
+//! herdr and its agents: the CLI and attached clients.
 
 use std::fmt;
-use std::fs;
-use std::io::{Read as _, Seek as _, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -13,11 +11,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::json::{key, key_str};
+use crate::kind::Kind;
 use crate::process::run_timed;
 use crate::{Error, Result};
 
-/// Bytes of a transcript read from its end
-pub const TRANSCRIPT_TAIL: u64 = 512 * 1024;
 pub const HERDR_TIMEOUT: Duration = Duration::from_secs(15);
 /// Lines above a choice on the screen that show what it is about
 const CHOICE_CONTEXT: usize = 8;
@@ -76,6 +73,7 @@ pub struct Agent {
     pub pane_id: String,
     pub status: Status,
     pub name: String,
+    pub kind: Kind,
     pub cwd: Option<String>,
     pub session: Option<Session>,
 }
@@ -217,10 +215,16 @@ pub fn list_agents(herdr: &mut dyn Herdr) -> Result<Vec<Agent>> {
                 .unwrap_or_default()
                 .to_owned(),
         });
+        let kind = raw
+            .get("agent")
+            .and_then(Value::as_str)
+            .or(session.as_ref().map(|s| s.agent.as_str()))
+            .map_or_else(|| Kind::Other(String::new()), Kind::parse);
         agents.push(Agent {
             pane_id: key_str(raw, "pane_id")?.to_owned(),
             status: Status::parse(key_str(raw, "agent_status")?),
             name: label,
+            kind,
             cwd: raw.get("cwd").and_then(Value::as_str).map(str::to_owned),
             session,
         });
@@ -407,277 +411,55 @@ pub fn choice(screen: &str) -> Option<Choice> {
     })
 }
 
-/// What Claude did since the last prompt, from its transcript. None for
-/// other agents.
-#[must_use]
-pub fn claude_turn(agent: &Agent, home: Option<&Path>) -> Option<Turn> {
-    read_turn(agent.session.as_ref()?, home, TRANSCRIPT_TAIL)
-}
-
-/// `claude_turn` from the last `tail` bytes of the transcript.
-#[must_use]
-pub fn read_turn(session: &Session, home: Option<&Path>, tail: u64) -> Option<Turn> {
-    if session.agent != "claude" || session.id.is_empty() {
-        return None;
-    }
-    let home = home.map_or_else(
-        || PathBuf::from(std::env::var("HOME").unwrap_or_default()),
-        Path::to_path_buf,
-    );
-    let projects = fs::read_dir(home.join(".claude").join("projects")).ok()?;
-    let path = projects
-        .filter_map(std::result::Result::ok)
-        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-        .map(|e| e.path().join(format!("{}.jsonl", session.id)))
-        .find(|p| p.exists())?;
-    let mut file = fs::File::open(path).ok()?;
-    let end = file.seek(SeekFrom::End(0)).ok()?;
-    let start = end.saturating_sub(tail);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut data = Vec::new();
-    file.read_to_end(&mut data).ok()?;
-    let text = String::from_utf8_lossy(&data);
-    let mut lines = text.split('\n');
-    if start > 0 {
-        lines.next();
-    }
-    Some(parse_turn(lines))
-}
-
-fn flag(entry: &Value, name: &str) -> bool {
-    entry.get(name).and_then(Value::as_bool).unwrap_or(false)
-}
-
-fn parse_turn<'a>(lines: impl Iterator<Item = &'a str>) -> Turn {
-    let mut messages = Vec::new();
-    let mut asked: IndexMap<Option<String>, Option<Value>> = IndexMap::new();
-    for line in lines {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if flag(&entry, "isSidechain") {
-            continue;
-        }
-        let content = entry.get("message").and_then(|m| m.get("content"));
-        let blocks = content
-            .and_then(Value::as_array)
-            .map_or(&[][..], Vec::as_slice);
-        let kind = |b: &Value| b.get("type").and_then(Value::as_str).map(str::to_owned);
-        match entry.get("type").and_then(Value::as_str) {
-            Some("user") => {
-                for b in blocks {
-                    let id = b
-                        .get("tool_use_id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    asked.shift_remove(&id);
-                }
-                if !flag(&entry, "isMeta")
-                    && (content.is_some_and(Value::is_string)
-                        || blocks.iter().any(|b| kind(b).as_deref() == Some("text")))
-                {
-                    messages.clear();
-                    asked.clear();
-                }
-            }
-            Some("assistant") => {
-                let said: Vec<&str> = blocks
-                    .iter()
-                    .filter(|b| kind(b).as_deref() == Some("text"))
-                    .filter_map(|b| b.get("text").and_then(Value::as_str))
-                    .filter(|t| !t.is_empty())
-                    .collect();
-                if !said.is_empty() {
-                    let uuid = entry.get("uuid").and_then(Value::as_str).map(str::to_owned);
-                    messages.push((uuid, said.join("\n\n")));
-                }
-                for b in blocks {
-                    if kind(b).as_deref() == Some("tool_use")
-                        && b.get("name").and_then(Value::as_str) == Some("AskUserQuestion")
-                    {
-                        let id = b.get("id").and_then(Value::as_str).map(str::to_owned);
-                        let questions =
-                            b.get("input")
-                                .and_then(|i| i.get("questions"))
-                                .filter(|q| match q {
-                                    Value::Array(items) => !items.is_empty(),
-                                    Value::Object(map) => !map.is_empty(),
-                                    _ => false,
-                                });
-                        asked.insert(id, questions.cloned());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Turn {
-        messages,
-        question: asked
-            .into_values()
-            .next_back()
-            .flatten()
-            .map(Questions::from),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TempDir;
     use serde_json::json;
 
-    fn fruit() -> Value {
-        json!([{"question": "Pick a fruit?", "header": "Fruit", "multiSelect": false,
-                "options": [{"label": "Apple", "description": "red"},
-                            {"label": "Pear", "description": "green"}]}])
-    }
+    struct Lists(Value);
 
-    fn write_lines(path: &Path, lines: &[Value]) -> String {
-        let text: String = lines.iter().map(|x| x.to_string() + "\n").collect();
-        fs::write(path, &text).expect("write");
-        text
-    }
-
-    fn append(path: &Path, line: &Value) {
-        let mut text = fs::read_to_string(path).expect("read");
-        text.push_str(&line.to_string());
-        text.push('\n');
-        fs::write(path, text).expect("write");
-    }
-
-    fn turn(messages: &[(&str, &str)], question: Option<Value>) -> Turn {
-        Turn {
-            messages: messages
-                .iter()
-                .map(|(u, t)| (Some((*u).to_owned()), (*t).to_owned()))
-                .collect(),
-            question: question.map(Questions::from),
-        }
-    }
-
-    fn claude(id: &str) -> Agent {
-        Agent {
-            pane_id: "w:p".into(),
-            status: Status::Idle,
-            name: "w".into(),
-            cwd: None,
-            session: Some(Session {
-                agent: "claude".into(),
-                id: id.into(),
-            }),
+    impl Herdr for Lists {
+        fn run(&mut self, args: &[&str]) -> Result<(i32, String)> {
+            Ok(match args {
+                ["agent", "list"] => (0, json!({"result": {"agents": self.0}}).to_string()),
+                _ => (1, String::new()),
+            })
         }
     }
 
     #[test]
-    fn claude_turn_reads_the_transcript() {
-        let dir = TempDir::new();
-        let home = dir.path().join("home");
-        let project = home.join(".claude/projects/-x");
-        fs::create_dir_all(&project).expect("mkdir");
-        let path = project.join("sid.jsonl");
-        write_lines(
-            &path,
-            &[
-                json!({"type": "user", "message": {"content": "first"}}),
-                json!({"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "old"}]}}),
-                json!({"type": "user", "message": {"content": "Hello"}}),
-                json!({"type": "assistant", "uuid": "a2", "message": {"content": [
-                {"type": "text", "text": "Looking."}, {"type": "tool_use", "name": "Bash"}]}}),
-                json!({"type": "user", "message": {"content": [{"type": "tool_result", "content": "x"}]}}),
-                json!({"type": "assistant", "uuid": "a3", "isSidechain": true,
-                   "message": {"content": [{"type": "text", "text": "side"}]}}),
-                json!({"type": "assistant", "uuid": "a4", "message": {"content": [{"type": "text", "text": "Done."}]}}),
-                json!({"type": "mode"}),
-            ],
-        );
-        let agent = claude("sid");
-        assert_eq!(
-            claude_turn(&agent, Some(&home)),
-            Some(turn(&[("a2", "Looking."), ("a4", "Done.")], None))
-        );
-        append(
-            &path,
-            &json!({"type": "assistant", "uuid": "a5", "message": {"content": [
-            {"type": "tool_use", "id": "t1", "name": "AskUserQuestion", "input": {"questions": fruit()}}]}}),
-        );
-        assert_eq!(
-            claude_turn(&agent, Some(&home))
-                .expect("turn")
-                .question
-                .map(|q| q.raw),
-            Some(fruit())
-        );
-        append(
-            &path,
-            &json!({"type": "user", "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "t1", "content": "x"}]}}),
-        );
-        assert_eq!(
-            claude_turn(&agent, Some(&home)).expect("turn").question,
-            None
-        );
-        assert_eq!(claude_turn(&claude("nope"), Some(&home)), None);
-        let bare = Agent {
-            session: None,
-            ..claude("sid")
+    fn agent_list_names_each_kind() {
+        let raw = |pane: &str, extra: Value| {
+            let mut agent = json!({"pane_id": pane, "workspace_id": "w", "agent_status": "idle"});
+            agent
+                .as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            agent
         };
-        assert_eq!(claude_turn(&bare, Some(&home)), None);
-    }
-
-    #[test]
-    fn transcript_tail_starts_at_a_whole_line() {
-        let dir = TempDir::new();
-        let home = dir.path().join("home");
-        let project = home.join(".claude/projects/-x");
-        fs::create_dir_all(&project).expect("mkdir");
-        let lines = [
-            json!({"type": "user", "message": {"content": "x".repeat(300)}}),
-            json!({"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "old"}]}}),
-            json!({"type": "user", "message": {"content": "Hello"}}),
-            json!({"type": "assistant", "uuid": "a2", "message": {"content": [{"type": "text", "text": "new"}]}}),
-        ];
-        let text = write_lines(&project.join("sid.jsonl"), &lines);
-        let agent = claude("sid");
-        let want = Some(turn(&[("a2", "new")], None));
-        for tail in [
-            text.len() - 20,
-            text.len() - 200,
-            lines[3].to_string().len() + 30,
-        ] {
-            assert_eq!(
-                read_turn(
-                    agent.session.as_ref().expect("a session"),
-                    Some(&home),
-                    tail as u64
-                ),
-                want,
-                "tail {tail}"
-            );
-        }
-    }
-
-    #[test]
-    fn meta_entries_do_not_start_a_turn() {
-        let dir = TempDir::new();
-        let home = dir.path().join("home");
-        let project = home.join(".claude/projects/-x");
-        fs::create_dir_all(&project).expect("mkdir");
-        write_lines(
-            &project.join("sid.jsonl"),
-            &[
-                json!({"type": "user", "message": {"content": "Hello"}}),
-                json!({"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "Looking."}]}}),
-                json!({"type": "assistant", "uuid": "a2", "message": {"content": [
-                {"type": "tool_use", "id": "t1", "name": "AskUserQuestion", "input": {"questions": fruit()}}]}}),
-                json!({"type": "user", "isMeta": true, "message": {"content": "<system-reminder>x</system-reminder>"}}),
-                json!({"type": "user", "isMeta": true, "message": {"content": [{"type": "text", "text": "<local-command-caveat>"}]}}),
-            ],
-        );
-        let agent = claude("sid");
+        let session =
+            json!({"agent": "claude", "kind": "id", "source": "herdr:claude", "value": "s"});
+        let mut herdr = Lists(json!([
+            raw("w:1", json!({"agent": "pi"})),
+            raw("w:2", json!({"agent": "claude", "agent_session": session})),
+            raw("w:3", json!({"agent": "codex"})),
+            raw("w:4", json!({"agent_session": session})),
+            raw("w:5", json!({})),
+        ]));
+        let kinds: Vec<Kind> = list_agents(&mut herdr)
+            .expect("agents")
+            .into_iter()
+            .map(|a| a.kind)
+            .collect();
         assert_eq!(
-            claude_turn(&agent, Some(&home)),
-            Some(turn(&[("a1", "Looking.")], Some(fruit())))
+            kinds,
+            [
+                Kind::Pi,
+                Kind::Claude,
+                Kind::Other("codex".into()),
+                Kind::Claude,
+                Kind::Other(String::new())
+            ]
         );
     }
 

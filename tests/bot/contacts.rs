@@ -334,6 +334,7 @@ fn contact_chat_takes_pictures() {
         OWNER,
         &json!({"msgtype": "m.image", "url": "mxc://x/y"}),
     );
+    t.files_wait();
     let prompt = t.herdr.did("prompt").last().cloned().expect("a prompt");
     assert_eq!(prompt[2], "wA:p1");
     assert!(prompt[3].starts_with("See the file "));
@@ -797,6 +798,7 @@ fn configure(t: &mut T, name: Option<&str>, prefix: Option<bool>, data: &[u8]) -
         name: name.map(Into::into),
         prefix,
         avatar: Some(avatar.clone()),
+        ..AgentSettings::default()
     }];
     avatar
 }

@@ -80,22 +80,46 @@
             let
               inherit (pkgs) lib;
               # The parts of Home Manager and of `programs.herdr` the module reads
-              home = {
+              home = { config, ... }: {
                 options = {
                   programs.herdr.enable = lib.mkEnableOption "herdr";
                   programs.herdr.package = lib.mkOption {
                     type = lib.types.package;
                     default = pkgs.emptyDirectory;
                   };
+                  home.username = lib.mkOption {
+                    type = lib.types.str;
+                    default = "u";
+                  };
+                  home.homeDirectory = lib.mkOption {
+                    type = lib.types.str;
+                    default = "/home/u";
+                  };
                   xdg.configHome = lib.mkOption {
                     type = lib.types.str;
                     default = "/home/u/.config";
+                  };
+                  xdg.cacheHome = lib.mkOption {
+                    type = lib.types.str;
+                    default = "${config.home.homeDirectory}/.cache";
+                  };
+                  xdg.stateHome = lib.mkOption {
+                    type = lib.types.str;
+                    default = "${config.home.homeDirectory}/.local/state";
+                  };
+                  home.packages = lib.mkOption {
+                    type = lib.types.listOf lib.types.package;
+                    default = [ ];
                   };
                   systemd.user.services = lib.mkOption {
                     type = lib.types.attrsOf lib.types.anything;
                     default = { };
                   };
                   systemd.user.timers = lib.mkOption {
+                    type = lib.types.attrsOf lib.types.anything;
+                    default = { };
+                  };
+                  systemd.user.sockets = lib.mkOption {
                     type = lib.types.attrsOf lib.types.anything;
                     default = { };
                   };
@@ -140,7 +164,14 @@
               homeManager = { config, ... }: {
                 options.home-manager.users = lib.mkOption {
                   type = lib.types.attrsOf (lib.types.submoduleWith {
-                    modules = [ self.homeModules.default home ];
+                    modules = [
+                      self.homeModules.default
+                      home
+                      ({ name, ... }: {
+                        home.username = lib.mkDefault name;
+                        home.homeDirectory = lib.mkDefault "/home/${name}";
+                      })
+                    ];
                     specialArgs = { inherit pkgs; osConfig = config; };
                   });
                   default = { };
@@ -219,7 +250,7 @@
                     }).options.programs.herdr.matrix;
                 }).optionsJSON;
               # The unit: `"`, `\\` and `%` escaped for systemd, tools on PATH and
-              # the model service only with a model
+              # the model service only with a model; the command on the user's PATH
               module-config = pass "herdr-matrix-module-config" (
                 lib.elem "\"HERDR_MATRIX_HOMESERVER=https://m.example.org/a%%b\\\"c\""
                   (service bare).Service.Environment
@@ -230,6 +261,7 @@
                 && (service hears).Unit.Wants == [ "herdr-matrix-models.service" ]
                 && lib.hasInfix "whisper-cpp" (path hears)
                 && lib.hasInfix "ffmpeg" (path hears)
+                && agents.home.packages == [ echo ]
               );
               # Per-agent settings: none, no file and no prompt units; else the
               # file, and a service and timer per prompt that pass its text whole
@@ -275,6 +307,173 @@
                   }
                   (eval { programs.herdr.matrix = matrix; }).assertions
               );
+              # A confined agent: its command on the user's PATH, its places in the
+              # agents file, and bwrap with only what it is granted; an agent without
+              # a sandbox stays as it is, and a bad sandbox fails evaluation
+              module-sandbox =
+                let
+                  confined = base: agents: evalWith { osConfig = os; } {
+                    programs.herdr = {
+                      enable = true;
+                      matrix = matrix // { package = echo; inherit agents; } // base;
+                    };
+                  };
+                  nora = sandbox: extra: confined { inherit gate; } {
+                    nora = { cwd = "/w/n o"; inherit sandbox; } // extra;
+                    quiet.cwd = "/w/q";
+                  };
+                  full = nora
+                    {
+                      enable = true;
+                      program = [ "/bin/probe" "a b" ];
+                      environment.K = "it's $x";
+                      allow = { readPaths = [ "/r o" ]; network = true; chats = { read = true; send = true; rooms = [ "!a:x" ]; }; sendFiles = true; };
+                    }
+                    { };
+                  bare = nora { enable = true; allow = { network = false; sendFiles = false; }; } { };
+                  plain = nora { enable = true; } { };
+                  pi = nora { enable = true; } { kind = "pi"; };
+                  ported = nora
+                    {
+                      enable = true;
+                      files = { "models.json" = "/m.json"; "a b/s.json" = "/s o.json"; };
+                      allow = { network = false; ports = { "11434" = "10.23.0.18:11444"; "2000" = "[::1]:80"; }; };
+                    }
+                    { kind = "pi"; };
+                  port = "herdr-matrix-port-nora-11434";
+                  badFile = key: fails "nora" "sandbox.files.\"${key}\" must be a path in the state directory, without an empty, `.` or `..` part."
+                    (nora { enable = true; files.${key} = "/m.json"; } { });
+                  badPort = key: fails "nora" "sandbox.allow.ports.\"${key}\": the port inside must be a number from 1024 to 65535."
+                    (nora { enable = true; allow = { network = false; ports.${key} = "h:1"; }; } { });
+                  badAddress = address: fails "nora" "sandbox.allow.ports.\"2000\": the address outside must be `host:port`."
+                    (nora { enable = true; allow = { network = false; ports."2000" = address; }; } { });
+                  fails = id: message: config: lib.elem
+                    {
+                      assertion = false;
+                      message = "programs.herdr.matrix.agents.${id}: ${message}";
+                    }
+                    config.assertions;
+                  inHome = cwd: confined { } { nora = { inherit cwd; sandbox.enable = true; }; };
+                  wrapper = config: "${lib.findFirst (p: p.name == "herdr-matrix-agent-nora") null config.home.packages}/bin/herdr-matrix-agent-nora";
+                  file = config: lib.removeSuffix "\"" (lib.removePrefix "\"HERDR_MATRIX_AGENTS=" (agentsFile config));
+                  places = {
+                    id = "nora";
+                    state = "/home/u/.local/state/herdr-matrix/agents/nora/claude";
+                    uploads = "/home/u/.cache/herdr-matrix/uploads/nora";
+                    files = "/home/u/.cache/herdr-matrix/agents/nora";
+                  };
+                  piState = "/home/u/.local/state/herdr-matrix/agents/nora/pi";
+                in
+                assert lib.all (a: a.assertion) full.assertions
+                && lib.all (a: a.assertion) bare.assertions
+                && map lib.getName full.home.packages == [ "herdr-matrix" "herdr-matrix-agent-nora" ]
+                && fails "nora" "the sandbox options need sandbox.enable." (nora { allow.sendFiles = false; } { })
+                && fails "nora" "the sandbox options need sandbox.enable." (nora { program = [ "x" ]; } { })
+                && fails "nora" "the sandbox options need sandbox.enable." (nora { program = [ "claude" ]; } { kind = "pi"; })
+                && lib.all (a: a.assertion) (nora { program = [ "pi" ]; } { kind = "pi"; }).assertions
+                && lib.all (a: a.assertion) pi.assertions
+                && fails "nora" "sandbox.allow.chats needs programs.herdr.matrix.gate.enable." (confined { } {
+                  nora = { cwd = "/w/n"; sandbox = { enable = true; allow.chats.read = true; }; };
+                })
+                && fails "nora" "sandbox.allow.chats.rooms needs sandbox.allow.chats.read or send." (nora { enable = true; allow.chats.rooms = [ "!a:x" ]; } { })
+                && fails "no.ra" "the name of a confined agent takes only letters, digits, `_` and `-`." (confined { } {
+                  "no.ra" = { cwd = "/w/n"; sandbox.enable = true; };
+                })
+                && lib.all (cwd: fails "nora" "the cwd of a confined agent must not hold the home directory." (inHome cwd)) [ "/home/u" "/home/u/" "/home" "/" ]
+                && lib.all (a: a.assertion) (inHome "/home/u/w").assertions
+                && lib.all (a: a.assertion) (inHome "/home/uw").assertions
+                && lib.all (a: a.assertion) ported.assertions
+                && fails "nora" "the sandbox options need sandbox.enable." (nora { files."m" = "/m"; } { })
+                && fails "nora" "the sandbox options need sandbox.enable." (nora { allow = { network = false; ports."2000" = "h:1"; }; } { })
+                && fails "nora" "sandbox.allow.ports needs sandbox.allow.network = false." (nora { enable = true; allow.ports."2000" = "h:1"; } { })
+                && lib.all badFile [ "/abs" "../x" "a/../b" "a/" "a//b" "." "" ]
+                && lib.all (a: a.assertion) (nora { enable = true; files."a/.b/c" = "/m"; } { }).assertions
+                && lib.all badPort [ "80" "1023" "65536" "01024" "0x400" "" "999999999999999999999" ]
+                && lib.all badAddress [ "h" ":1" "h:" "h:p" "a b:1" "h:1 x" "::1:80" "h:1%2" ]
+                && lib.all (a: a.assertion) (nora { enable = true; allow = { network = false; ports = { "1024" = "my-host.lan:1"; "65535" = "10.0.0.1:65535"; }; }; } { }).assertions
+                && plain.systemd.user.sockets == { }
+                && lib.attrNames ported.systemd.user.sockets == [ port "herdr-matrix-port-nora-2000" ]
+                && ported.systemd.user.sockets.${port} == {
+                  Unit.Description = "herdr-matrix port 11434 of nora";
+                  Socket = { ListenStream = "%t/herdr-matrix/ports/nora/11434"; SocketMode = "0600"; DirectoryMode = "0700"; };
+                  Install.WantedBy = [ "sockets.target" ];
+                }
+                && ported.systemd.user.services.${port} == {
+                  Unit = { Description = "herdr-matrix port 11434 of nora"; Requires = [ "${port}.socket" ]; After = [ "${port}.socket" ]; };
+                  Service.ExecStart = "${pkgs.systemd}/lib/systemd/systemd-socket-proxyd --exit-idle-time=5min 10.23.0.18:11444";
+                }
+                && ported.systemd.user.services."herdr-matrix-port-nora-2000".Service.ExecStart
+                == "${pkgs.systemd}/lib/systemd/systemd-socket-proxyd --exit-idle-time=5min [::1]:80";
+                pkgs.runCommand "herdr-matrix-module-sandbox" { nativeBuildInputs = [ pkgs.jq ]; } ''
+                  jq -e '. == [
+                    {"cwd": "/w/n o", "name": null, "prefix": null, "avatar": null, "sandbox": ${builtins.toJSON places}},
+                    {"cwd": "/w/q", "name": null, "prefix": null, "avatar": null}
+                  ]' ${file full}
+                  jq -e '.[0] == {"cwd": "/w/n o", "name": null, "prefix": null, "avatar": null, "kind": "pi",
+                    "sandbox": ${builtins.toJSON (places // { state = piState; })}}' ${file pi}
+                  full=${wrapper full}
+                  bare=${wrapper bare}
+                  for want in \
+                    "--unshare-all --share-net --die-with-parent --clearenv" \
+                    "--ro-bind /nix/store /nix/store --ro-bind /etc /etc --ro-bind /run/current-system /run/current-system" \
+                    "--proc /proc --dev /dev --tmpfs /tmp --tmpfs /home/u" \
+                    "--bind '/w/n o' '/w/n o' --bind ${places.state} ${places.state} --ro-bind ${places.files} ${places.files}" \
+                    "--bind ${places.uploads} ${places.uploads}" \
+                    "--bind /run/herdr-matrix-gate/u.nora /run/herdr-matrix-gate/u.nora" \
+                    "--ro-bind '/r o' '/r o' --chdir '/w/n o'" \
+                    "--setenv HOME /home/u --setenv CLAUDE_CONFIG_DIR ${places.state} --setenv HERDR_AGENT claude" \
+                    "--setenv HERDR_MATRIX_GATE_SOCKET /run/herdr-matrix-gate/u.nora/socket" \
+                    "--setenv HERDR_MATRIX_UPLOADS ${places.uploads}" \
+                    "--setenv K 'it'\'''s \$x'" \
+                    "-- /bin/probe 'a b' \"\$@\""
+                  do
+                    grep -qF -- "$want" "$full" || { echo "missing: $want"; exit 1; }
+                  done
+                  grep -qF -- "--unshare-all --die-with-parent --clearenv" "$bare"
+                  grep -qF -- "-- claude \"\$@\"" "$bare"
+                  for absent in --share-net --new-session HERDR_MATRIX_GATE_SOCKET HERDR_MATRIX_UPLOADS /run/herdr-matrix-gate /uploads/; do
+                    if grep -qF -- "$absent" "$bare"; then echo "present: $absent"; exit 1; fi
+                  done
+                  if grep -qF -- --new-session "$full"; then exit 1; fi
+                  plain=${wrapper plain}
+                  grep -qF -- "--unshare-all --share-net --die-with-parent" "$plain"
+                  grep -qF -- "--ro-bind-try /run/systemd/resolve /run/systemd/resolve" "$plain"
+                  grep -qF -- "--setenv HERDR_MATRIX_UPLOADS" "$plain"
+                  if grep -qF -- /run/herdr-matrix-gate "$plain"; then exit 1; fi
+                  pi=${wrapper pi}
+                  for want in \
+                    "mkdir -p -- ${piState} ${places.files} ${places.uploads}" \
+                    "--bind '/w/n o' '/w/n o' --bind ${piState} ${piState} --ro-bind ${places.files} ${places.files}" \
+                    "--setenv HOME /home/u --setenv PI_CODING_AGENT_DIR ${piState} --setenv HERDR_AGENT pi --setenv HERDR_MATRIX_UPLOADS" \
+                    "-- pi \"\$@\""
+                  do
+                    grep -qF -- "$want" "$pi" || { echo "missing: $want"; exit 1; }
+                  done
+                  if grep -qF -- CLAUDE_CONFIG_DIR "$pi"; then exit 1; fi
+                  for launcher in "$full" "$bare" "$plain" "$pi"; do
+                    if grep -qF -- herdr-matrix/ports "$launcher"; then echo "ports: $launcher"; exit 1; fi
+                  done
+                  ported=${wrapper ported}
+                  inner=$(grep -o '/nix/store/[^ ]*-herdr-matrix-agent-nora-ports' "$ported")
+                  for want in \
+                    "--bind ${piState} ${piState} --ro-bind '/s o.json' '${piState}/a b/s.json' --ro-bind /m.json ${piState}/models.json --ro-bind ${places.files} ${places.files}" \
+                    'ports=$XDG_RUNTIME_DIR/herdr-matrix/ports/nora' \
+                    "--ro-bind \"\$ports\" \"\$ports\" -- $inner \"\$ports\" pi \"\$@\""
+                  do
+                    grep -qF -- "$want" "$ported" || { echo "missing: $want"; exit 1; }
+                  done
+                  for want in \
+                    "TCP-LISTEN:2000,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:\"\$dir\"/2000" \
+                    "TCP-LISTEN:11434,bind=127.0.0.1,fork,reuseaddr UNIX-CONNECT:\"\$dir\"/11434" \
+                    "${pkgs.socat}/bin/socat" \
+                    "unset HERDR_AGENT" \
+                    '</dev/null >/dev/null 2>&1 &'
+                  do
+                    grep -qF -- "$want" "$inner" || { echo "missing in $inner: $want"; exit 1; }
+                  done
+                  test "$(grep -v '^$' "$inner" | tail -n 1)" = 'exec "$@"'
+                  touch $out
+                '';
               # A model is kept only with its hash, and only a new one restarts the bot
               models-script =
                 let
@@ -340,6 +539,49 @@
                       home-manager.users.bob = { };
                     }
                   ])
+                );
+              # A confined agent with chats gets a socket and service of its own, with
+              # its commands and rooms; the user's own units stay as they are
+              gate-agents =
+                let
+                  withAgents = agents: nixos [
+                    homeManager
+                    {
+                      home-manager.users.alice.programs.herdr = {
+                        enable = true;
+                        matrix = matrix // { inherit gate agents; };
+                      };
+                    }
+                  ];
+                  plain = withAgents { quiet.cwd = "/w/q"; };
+                  confined = withAgents {
+                    quiet.cwd = "/w/q";
+                    nora = { cwd = "/w/n"; sandbox = { enable = true; allow.chats = { read = true; rooms = [ "!a:x" "!b%:x" ]; }; }; };
+                    mia = { cwd = "/w/m"; sandbox = { enable = true; allow.chats = { read = true; send = true; }; }; };
+                    bare = { cwd = "/w/b"; sandbox.enable = true; };
+                  };
+                  service = config: name: config.systemd.services."herdr-matrix-gate-${name}@";
+                  env = name: (service confined "alice.${name}").environment;
+                in
+                pass "herdr-matrix-gate-agents" (
+                  lib.attrNames plain.systemd.sockets == [ "herdr-matrix-gate-alice" ]
+                  && lib.attrNames confined.systemd.sockets
+                  == [ "herdr-matrix-gate-alice" "herdr-matrix-gate-alice.mia" "herdr-matrix-gate-alice.nora" ]
+                  && confined.systemd.sockets.herdr-matrix-gate-alice == plain.systemd.sockets.herdr-matrix-gate-alice
+                  && service confined "alice" == service plain "alice"
+                  && !((service plain "alice").environment ? HERDR_MATRIX_GATE_COMMANDS)
+                  && confined.systemd.sockets."herdr-matrix-gate-alice.nora".socketConfig
+                  == plain.systemd.sockets.herdr-matrix-gate-alice.socketConfig // {
+                    ListenStream = "/run/herdr-matrix-gate/alice.nora/socket";
+                  }
+                  && (service confined "alice.nora").serviceConfig == (service plain "alice").serviceConfig
+                  && env "nora" == (service plain "alice").environment // {
+                    HERDR_MATRIX_GATE_COMMANDS = "rooms read search";
+                    HERDR_MATRIX_GATE_ROOMS = "!a:x !b%%:x";
+                  }
+                  && env "mia" == (service plain "alice").environment // {
+                    HERDR_MATRIX_GATE_COMMANDS = "rooms read search send";
+                  }
                 );
             }
             // lib.optionalAttrs pkgs.stdenv.isLinux {

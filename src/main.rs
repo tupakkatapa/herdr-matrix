@@ -1,11 +1,13 @@
+use std::path::Path;
 use std::process::ExitCode;
 
-use herdr_matrix::app::{Target, from_env, queue_prompt, serve};
+use herdr_matrix::app::{Target, from_env, queue_file, queue_prompt, serve};
 use herdr_matrix::{chats, gate};
 
 const USAGE: &str = "usage: herdr-matrix
        herdr-matrix prompt <agent> <text>...
        herdr-matrix prompt --cwd <dir> <text>...
+       herdr-matrix send <file> [caption]...
        herdr-matrix chats <rooms|read|search|send> ...
        herdr-matrix gate";
 
@@ -25,6 +27,17 @@ fn main() -> anyhow::Result<ExitCode> {
         {
             queue_prompt(&env, Target::Agent(agent), &text.join(" "))?;
             return Ok(ExitCode::SUCCESS);
+        }
+        [command, file, caption @ ..] if command == "send" => {
+            return Ok(
+                match queue_file(&env, Path::new(file), &caption.join(" ")) {
+                    Ok(_) => ExitCode::SUCCESS,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        ExitCode::FAILURE
+                    }
+                },
+            );
         }
         [command, request @ ..] if command == "chats" => {
             return Ok(match chats::ask(&env, request) {

@@ -2,13 +2,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::rc::Rc;
 use std::time::Duration;
 
 use crate::testutil::TempDir;
 use herdr_matrix::bot::{Bot, Deps, MARK, To};
 use herdr_matrix::herdr::{Herdr, Turn};
-use herdr_matrix::matrix::{Matrix, quote};
+use herdr_matrix::matrix::{Matrix, Source, quote};
 use herdr_matrix::state::{Away, Store};
 use herdr_matrix::{Error, Result};
 use indexmap::IndexMap;
@@ -63,6 +64,8 @@ pub struct HerdrState {
     pub list_out: Option<String>,
     /// Workspace id → its label, when not `repo-<id>`
     pub labels: HashMap<String, String>,
+    /// Pane → the kind of its agent, when not Claude, which herdr knows no session of
+    pub kinds: HashMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -135,7 +138,7 @@ impl Herdr for FakeHerdr {
                     .agents
                     .iter()
                     .map(|(p, status)| {
-                        json!({
+                        let mut agent = json!({
                             "agent": "claude",
                             "agent_session": {"agent": "claude", "kind": "id",
                                               "source": "herdr:claude", "value": format!("s-{p}")},
@@ -144,7 +147,15 @@ impl Herdr for FakeHerdr {
                             "revision": 1, "state_change_seq": 1, "tab_id": "w1:t1",
                             "terminal_id": "term_1", "terminal_title": "claude",
                             "terminal_title_stripped": "claude",
-                            "workspace_id": p.split(':').next().unwrap_or_default()})
+                            "workspace_id": p.split(':').next().unwrap_or_default()});
+                        if let Some(kind) = s.kinds.get(p) {
+                            agent["agent"] = json!(kind);
+                            agent
+                                .as_object_mut()
+                                .expect("an object")
+                                .remove("agent_session");
+                        }
+                        agent
                     })
                     .collect();
                 (
@@ -204,6 +215,8 @@ pub struct MatrixState {
     pub ids: Vec<String>,
     pub uploads: Vec<Vec<u8>>,
     pub mimes: Vec<String>,
+    /// The largest upload, as the homeserver says it
+    pub limit: Option<u64>,
     pub fail_send: usize,
     /// Sends the homeserver stores but whose answer is lost
     pub lose_reply: usize,
@@ -388,18 +401,27 @@ impl Matrix for FakeMatrix {
         Ok(json!({}))
     }
 
-    fn upload(&mut self, data: &[u8], content_type: &str) -> Result<String> {
+    fn upload(&mut self, data: &mut dyn Source, len: u64, content_type: &str) -> Result<String> {
+        let mut read = Vec::new();
+        data.read_to_end(&mut read)?;
+        assert_eq!(read.len() as u64, len);
         {
             let mut s = self.0.borrow_mut();
-            s.uploads.push(data.to_vec());
+            s.uploads.push(read);
             s.mimes.push(content_type.into());
         }
         let resp = self.call("POST", "/upload", None, &[], Duration::from_secs(30))?;
         Ok(resp["content_uri"].as_str().unwrap_or_default().to_owned())
     }
 
-    fn download(&mut self, mxc: &str) -> Result<Vec<u8>> {
-        Ok(format!("img {mxc}").into_bytes())
+    fn download(&mut self, mxc: &str, out: &mut dyn Write) -> Result<()> {
+        out.write_all(format!("img {mxc}").as_bytes())?;
+        Ok(())
+    }
+
+    fn upload_limit(&mut self) -> Result<Option<u64>> {
+        self.call("GET", "/media/config", None, &[], Duration::from_secs(30))?;
+        Ok(self.0.borrow().limit)
     }
 
     fn next_txn(&mut self) -> String {
@@ -550,6 +572,7 @@ impl T {
                 spawn_avatar: None,
                 spawn_prefix: true,
                 inbox: Some(self.inbox()),
+                uploads: Some(self.uploads()),
                 agents: Vec::new(),
             },
         )
@@ -678,6 +701,45 @@ impl T {
 
     pub fn inbox(&self) -> std::path::PathBuf {
         self.dir.path().join("prompts")
+    }
+
+    /// Files from the chat, once no more come.
+    pub fn files_wait(&mut self) {
+        self.advance(herdr_matrix::bot::FILES_WAIT.as_secs_f64());
+        self.bot.hand_over_files();
+    }
+
+    pub fn uploads(&self) -> std::path::PathBuf {
+        self.dir.path().join("uploads")
+    }
+
+    /// Queues a file as `herdr-matrix send` does in `pane`.
+    pub fn send_file(&self, pane: &str, name: &str, data: &[u8], caption: Option<&str>) {
+        let source = self.dir.path().join(name);
+        std::fs::write(&source, data).expect("write");
+        let upload = herdr_matrix::inbox::Upload {
+            pane: pane.into(),
+            name: name.into(),
+            caption: caption.map(str::to_owned),
+            at: self.now(),
+        };
+        let mut file = std::fs::File::open(&source).expect("open");
+        herdr_matrix::inbox::queue_upload(&self.uploads(), &upload, &mut file).expect("queued");
+    }
+
+    /// The events with a file the bot sent, in one room or in all.
+    pub fn files_sent(&self, room: Option<&str>) -> Vec<Value> {
+        let inside = room.map_or_else(
+            || "/send/".to_owned(),
+            |r| format!("/rooms/{}/send/", quote(r)),
+        );
+        self.matrix
+            .calls()
+            .into_iter()
+            .filter(|c| c.0 == "PUT" && c.1.contains(&inside))
+            .filter_map(|c| c.2)
+            .filter(|b| b.get("url").is_some())
+            .collect()
     }
 
     pub fn log_lines(&self) -> Vec<String> {

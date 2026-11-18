@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::hash::{BuildHasher as _, Hasher as _, RandomState};
-use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
@@ -16,7 +16,7 @@ use regex::Regex;
 use crate::{Error, Result};
 
 /// How long a file from the chat is kept
-pub const FILE_TTL: Duration = Duration::from_hours(24);
+pub const FILE_TTL: Duration = Duration::from_hours(30 * 24);
 
 /// Eight random characters for a file name.
 pub(crate) fn random_name() -> String {
@@ -32,11 +32,17 @@ pub(crate) fn random_name() -> String {
 }
 
 /// Saves a file from the chat in `dir`, a private directory, after files
-/// older than `FILE_TTL`; its path. `now` is in seconds since the epoch.
+/// older than `FILE_TTL`: `fill` writes it. Its path; nothing when `fill`
+/// fails. `now` is in seconds since the epoch.
 ///
 /// # Errors
-/// When `dir` is not private or the file cannot be written.
-pub fn store(dir: &Path, now: f64, name: &str, data: &[u8]) -> Result<PathBuf> {
+/// When `dir` is not private, or the file cannot be made or filled.
+pub fn store(
+    dir: &Path,
+    now: f64,
+    name: &str,
+    fill: &mut dyn FnMut(&mut fs::File) -> Result<()>,
+) -> Result<PathBuf> {
     static UNSAFE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"[^A-Za-z0-9._-]").expect("a valid pattern"));
     private_dir(dir)?;
@@ -52,9 +58,12 @@ pub fn store(dir: &Path, now: f64, name: &str, data: &[u8]) -> Result<PathBuf> {
             .mode(0o600)
             .open(&path)
         {
-            Ok(mut file) => {
-                file.write_all(data)?;
-                return Ok(path);
+            Ok(mut made) => {
+                let filled = fill(&mut made);
+                if filled.is_err() {
+                    let _ = fs::remove_file(&path);
+                }
+                return filled.map(|()| path);
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(err) => return Err(err.into()),
@@ -85,7 +94,7 @@ pub fn private_dir(dir: &Path) -> Result<()> {
 
 /// Removes the files in `dir` older than `old`, seconds since the epoch.
 /// One that vanishes or cannot be read meanwhile stays out of it.
-fn purge(dir: &Path, old: f64) -> Result<()> {
+pub(crate) fn purge(dir: &Path, old: f64) -> Result<()> {
     for entry in fs::read_dir(dir)?.filter_map(std::result::Result::ok) {
         let mtime = entry
             .metadata()
@@ -101,6 +110,34 @@ fn purge(dir: &Path, old: f64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Opens `path`, a regular file under `root`, to read, when no part of the
+/// path below `root` is a symlink: a confined agent can write there, and
+/// a link may point anywhere this user can read.
+///
+/// # Errors
+/// When the path is not a regular file under `root` by itself, or cannot
+/// be opened.
+pub fn open_inside(root: &Path, path: &Path) -> std::io::Result<fs::File> {
+    let refused = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{}: not a regular file", path.display()),
+        )
+    };
+    // Opening a FIFO would wait for a writer
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(refused());
+    }
+    let file = fs::File::open(path)?;
+    // Where the open file is, as the kernel resolved it
+    let opened = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    let below = path.strip_prefix(root).map_err(|_| refused())?;
+    if !file.metadata()?.is_file() || opened != fs::canonicalize(root)?.join(below) {
+        return Err(refused());
+    }
+    Ok(file)
 }
 
 /// The user this process runs as.
@@ -159,4 +196,106 @@ pub fn folders(workspace: &Path, query: Option<&str>) -> Vec<String> {
     };
     dirs.sort();
     dirs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+    use std::io::Write as _;
+
+    fn aged(path: &Path, now: f64, age: Duration) {
+        let at = UNIX_EPOCH + Duration::from_secs_f64(now) - age;
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_modified(at)
+            .expect("utime");
+    }
+
+    #[test]
+    fn stored_file_is_private_and_old_ones_go() {
+        let dir = TempDir::new();
+        let files = dir.path().join("files");
+        let now = 2_000_000_000.0;
+        private_dir(&files).expect("private");
+        for (name, age) in [
+            ("old", FILE_TTL + Duration::from_secs(1)),
+            ("young", FILE_TTL.saturating_sub(Duration::from_mins(1))),
+        ] {
+            fs::write(files.join(name), name).expect("write");
+            aged(&files.join(name), now, age);
+        }
+        let path = store(&files, now, "a/b c.png", &mut |file| {
+            file.write_all(b"data")?;
+            Ok(())
+        })
+        .expect("stored");
+        assert_eq!(fs::read(&path).expect("read"), b"data");
+        let name = path.file_name().expect("a name").to_string_lossy();
+        assert!(
+            name.starts_with("2000000000-") && name.ends_with("-b_c.png"),
+            "{name}"
+        );
+        assert_eq!(
+            fs::metadata(&path).expect("stat").permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&files).expect("stat").permissions().mode() & 0o7777,
+            0o700
+        );
+        assert!(!files.join("old").exists());
+        assert!(files.join("young").exists());
+    }
+
+    #[test]
+    fn only_a_regular_file_under_the_root_opens() {
+        let dir = TempDir::new();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        for d in [root.join("real"), outside.clone()] {
+            fs::create_dir_all(d).expect("mkdir");
+        }
+        fs::write(root.join("real/a.jsonl"), "mine").expect("write");
+        fs::write(outside.join("a.jsonl"), "secret").expect("write");
+        std::os::unix::fs::symlink(outside.join("a.jsonl"), root.join("real/b.jsonl"))
+            .expect("symlink");
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+        let mut read = String::new();
+        std::io::Read::read_to_string(
+            &mut open_inside(&root, &root.join("real/a.jsonl")).expect("open"),
+            &mut read,
+        )
+        .expect("read");
+        assert_eq!(read, "mine");
+        for path in [
+            root.join("real/b.jsonl"),
+            root.join("link/a.jsonl"),
+            root.join("real"),
+            outside.join("a.jsonl"),
+        ] {
+            assert!(open_inside(&root, &path).is_err(), "{}", path.display());
+        }
+        assert_eq!(
+            open_inside(&root, &root.join("real/none"))
+                .expect_err("missing")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn failed_fill_leaves_no_file() {
+        let dir = TempDir::new();
+        let files = dir.path().join("files");
+        let err = store(&files, 1000.0, "a.png", &mut |file| {
+            file.write_all(b"part")?;
+            Err(crate::Error::Transport("gone".into()))
+        })
+        .expect_err("failed");
+        assert_eq!(err.to_string(), "cannot reach the homeserver: gone");
+        assert_eq!(fs::read_dir(&files).expect("list").count(), 0);
+    }
 }
