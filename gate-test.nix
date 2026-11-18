@@ -46,8 +46,8 @@ let
     case $me in
       bare)
         absent /run/herdr-matrix-gate $home/.cache/herdr-matrix/uploads
-        refused "the gate is not set up for this user" herdr-matrix chats rooms
-        refused "not in a herdr pane" herdr-matrix send /tmp/shot.png
+        refused "herdr-matrix: the gate is not set up for this user" herdr-matrix chats rooms
+        refused "herdr-matrix: send works only in a herdr pane: HERDR_PANE_ID is not set" herdr-matrix send /tmp/shot.png
         never online
         ports=/run/user/1000/herdr-matrix/ports
         [ "$(find /run/user -maxdepth 4)" = "$(printf '%s\n' /run/user{,/1000{,/herdr-matrix{,/ports{,/bare}}}})" ] || fail "runtime: $(find /run/user)"
@@ -78,9 +78,9 @@ let
         never grep -qF '!other:x' <<<"$rooms"
         herdr-matrix chats read '!bridged:x' | grep -qF 'hello from signal'
         herdr-matrix chats search '!bridged:x' hello | grep -qF 'hello from signal'
-        refused "not a bridged chat" herdr-matrix chats read '!other:x'
-        refused "not allowed for this agent" herdr-matrix chats send '!bridged:x' hi
-        refused "not in a herdr pane" herdr-matrix send /tmp/shot.png
+        refused "herdr-matrix: not a bridged chat" herdr-matrix chats read '!other:x'
+        refused "herdr-matrix: not allowed for this agent" herdr-matrix chats send '!bridged:x' hi
+        refused "herdr-matrix: send works only in a herdr pane: HERDR_PANE_ID is not set" herdr-matrix send /tmp/shot.png
         never online
         ;;
       mia)
@@ -90,7 +90,7 @@ let
         rooms=$(herdr-matrix chats rooms)
         grep -qF '!other:x' <<<"$rooms" || fail "$rooms"
         herdr-matrix chats send '!other:x' hi
-        refused "not a bridged chat" herdr-matrix chats send '!herdr:x' hi
+        refused "herdr-matrix: not a bridged chat" herdr-matrix chats send '!herdr:x' hi
         herdr-matrix send /tmp/shot.png Look
         online
         ;;
@@ -245,11 +245,11 @@ pkgs.testers.runNixOSTest {
     assert '"body": "hello from signal"' in read, read
     machine.succeed("sudo -u alice herdr-matrix chats send '!bridged:x' hi")
     refused = machine.fail("sudo -u alice herdr-matrix chats send '!herdr:x' hi 2>&1")
-    assert refused.strip() == "not a bridged chat", refused
+    assert refused.strip() == "herdr-matrix: not a bridged chat", refused
 
     machine.fail("systemctl cat herdr-matrix-gate-bob.socket")
     bob = machine.fail("sudo -u bob herdr-matrix chats rooms 2>&1")
-    assert bob.strip() == "the gate is not set up for this user", bob
+    assert bob.strip() == "herdr-matrix: the gate is not set up for this user", bob
     denied = machine.fail(
         "sudo -u bob env HERDR_MATRIX_GATE_SOCKET=/run/herdr-matrix-gate/alice herdr-matrix chats rooms 2>&1"
     )

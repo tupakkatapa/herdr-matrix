@@ -15,16 +15,21 @@ use crate::herdr::{Agent, Turn};
 /// directory.
 #[must_use]
 pub fn turn(agent: &Agent, dir: &Path) -> Option<Turn> {
-    let reported = agent
-        .session
-        .as_ref()
-        .filter(|s| s.agent == "pi" && Path::new(&s.id).is_absolute())
-        .map(|s| PathBuf::from(&s.id));
-    let path = match reported {
+    let path = match reported(agent) {
         Some(path) => path,
         None => newest(entries(&sessions(dir, agent.cwd.as_deref()?)))?,
     };
     Some(parse(&tail(fs::File::open(path).ok()?, TAIL)?))
+}
+
+/// The session file herdr reports for a pi agent.
+#[must_use]
+pub fn reported(agent: &Agent) -> Option<PathBuf> {
+    agent
+        .session
+        .as_ref()
+        .filter(|s| s.agent == "pi" && Path::new(&s.id).is_absolute())
+        .map(|s| PathBuf::from(&s.id))
 }
 
 /// pi's own directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.

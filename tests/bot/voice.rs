@@ -27,7 +27,7 @@ fn voice_command() {
     let mut t = T::new();
     t.set("wA:p1", "idle");
     t.speak("!agents");
-    assert_eq!(t.last_msg(), "Agents:\n\n> repo-wA  idle");
+    assert_eq!(t.last_msg(), "Agents (away is off):\n\n> 1. repo-wA  idle");
     assert!(t.herdr.did("prompt").is_empty());
 }
 
@@ -36,7 +36,7 @@ fn spoken_command() {
     let mut t = T::new();
     t.set("wA:p1", "idle");
     t.speak("Agents.");
-    assert_eq!(t.last_msg(), "Agents:\n\n> repo-wA  idle");
+    assert_eq!(t.last_msg(), "Agents (away is off):\n\n> 1. repo-wA  idle");
     t.speak("Attach repo-wA.");
     assert_eq!(t.bot.state().attached.as_deref(), Some("wA:p1"));
     t.speak("Screen 5.");
@@ -236,5 +236,34 @@ fn transcript_outlives_a_failed_delete() {
     assert_eq!(
         t.herdr.did("prompt"),
         vec![c(&["agent", "prompt", "wA:p1", "hello there"])]
+    );
+}
+
+#[test]
+fn voice_message_is_read_and_typed_while_heard() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    let from = t.matrix.calls().len();
+    t.speak("run the tests");
+    let steps: Vec<&str> = t.matrix.calls()[from..]
+        .iter()
+        .filter_map(|c| {
+            ["/receipt/", "/typing/", "/send/"]
+                .into_iter()
+                .find(|part| c.1.contains(part))
+        })
+        .collect();
+    assert_eq!(steps[..4], ["/receipt/", "/typing/", "/send/", "/typing/"]);
+    assert_eq!(t.matrix.typing(), [true, false]);
+}
+
+#[test]
+fn spoken_new_with_more_words_is_a_prompt() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.speak("New tests, please.");
+    assert_eq!(
+        t.herdr.did("prompt").last().expect("a prompt")[3],
+        "New tests, please."
     );
 }

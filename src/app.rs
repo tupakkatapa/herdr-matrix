@@ -33,6 +33,8 @@ pub struct Settings {
     /// The whisper.cpp model and the language it hears
     pub whisper: Option<(String, String)>,
     pub agents: Vec<AgentSettings>,
+    /// Where `!new` looks for folders
+    pub workspace: PathBuf,
 }
 
 impl fmt::Debug for Settings {
@@ -49,6 +51,7 @@ impl fmt::Debug for Settings {
             .field("spawn_prefix", &self.spawn_prefix)
             .field("whisper", &self.whisper)
             .field("agents", &self.agents)
+            .field("workspace", &self.workspace)
             .finish()
     }
 }
@@ -94,7 +97,28 @@ fn need_files_dir(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
     files_dir(env).ok_or_else(|| Error::Setting("neither XDG_CACHE_HOME nor HOME is set".into()))
 }
 
-/// The service's settings.
+/// The credential `name` that systemd passes, without the whitespace
+/// around it.
+///
+/// # Errors
+/// When `CREDENTIALS_DIRECTORY` is not set, or the credential cannot be
+/// read or is empty.
+pub(crate) fn credential(env: &dyn Fn(&str) -> Option<String>, name: &str) -> Result<String> {
+    let dir = env("CREDENTIALS_DIRECTORY")
+        .ok_or_else(|| Error::Setting("CREDENTIALS_DIRECTORY is not set".into()))?;
+    let path = Path::new(&dir).join(name);
+    let refused = |why: &str| Error::Setting(format!("{}: {why}", path.display()));
+    match fs::read_to_string(&path)
+        .map_err(|err| refused(&err.to_string()))?
+        .trim()
+    {
+        "" => Err(refused("empty")),
+        value => Ok(value.to_owned()),
+    }
+}
+
+/// The service's settings. The token is `HERDR_MATRIX_TOKEN`, else the
+/// credential `token`.
 ///
 /// # Errors
 /// When a required setting is missing or one is malformed.
@@ -123,9 +147,13 @@ pub fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<Settings> {
             .and_then(|data| serde_json::from_slice(&data).map_err(|err| err.to_string()))
             .map_err(|err| Error::Setting(format!("HERDR_MATRIX_AGENTS {path}: {err}")))?,
     };
+    let token = match env("HERDR_MATRIX_TOKEN") {
+        None if env("CREDENTIALS_DIRECTORY").is_some() => credential(env, "token")?,
+        _ => need("HERDR_MATRIX_TOKEN")?,
+    };
     Ok(Settings {
         homeserver,
-        token: need("HERDR_MATRIX_TOKEN")?,
+        token,
         owner: need("HERDR_MATRIX_OWNER")?,
         state_path: state.join("matrix-state.json"),
         files: need_files_dir(env)?,
@@ -140,6 +168,12 @@ pub fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<Settings> {
             )
         }),
         agents,
+        workspace: env("HERDR_MATRIX_WORKSPACE")
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(
+                || Path::new(&env("HOME").unwrap_or_default()).join("Workspace"),
+                PathBuf::from,
+            ),
     })
 }
 
@@ -161,6 +195,7 @@ pub fn from_env(env: &dyn Fn(&str) -> Option<String>) -> Result<Bot> {
         spawn_avatar: s.spawn_avatar,
         spawn_prefix: s.spawn_prefix,
         agents: s.agents,
+        workspace: s.workspace,
         ..Deps::default()
     };
     if let Some((model, language)) = s.whisper {
@@ -251,7 +286,9 @@ pub fn queue_file(
         Some(_) => String::new(),
         None => env("HERDR_PANE_ID")
             .filter(|pane| !pane.is_empty())
-            .ok_or_else(|| Error::Refused("not in a herdr pane".into()))?,
+            .ok_or_else(|| {
+                Error::Refused("send works only in a herdr pane: HERDR_PANE_ID is not set".into())
+            })?,
     };
     let refused = |why: &str| Error::Refused(format!("{}: {why}", path.display()));
     // Opening a FIFO would wait for a writer
@@ -449,7 +486,8 @@ mod tests {
         let file = dir.path().join("agents.json");
         fs::write(
             &file,
-            r#"[{"cwd": "/w/a", "name": "Kate", "prefix": false, "avatar": "/k.png"},
+            r#"[{"cwd": "/w/a", "name": "Kate", "prefix": false, "avatar": "/k.png",
+                 "chat": true, "autostart": true},
                 {"cwd": "/w/b", "name": null, "prefix": null, "avatar": null}]"#,
         )
         .expect("write");
@@ -466,6 +504,8 @@ mod tests {
                     name: Some("Kate".into()),
                     prefix: Some(false),
                     avatar: Some("/k.png".into()),
+                    chat: true,
+                    autostart: true,
                     ..AgentSettings::default()
                 },
                 AgentSettings {
@@ -569,6 +609,53 @@ mod tests {
             let err = queue_prompt(&|k| env.get(k).cloned(), target, text).expect_err("empty");
             assert!(matches!(err, Error::Setting(_)), "{err}");
         }
+    }
+
+    #[test]
+    fn token_comes_from_the_variable_else_the_credential() {
+        let dir = TempDir::new();
+        let creds = dir.path().join("creds");
+        fs::create_dir(&creds).expect("mkdir");
+        let token = creds.join("token");
+        fs::write(&token, "secret\n").expect("write");
+        let mut env = env(
+            dir.path(),
+            &[("CREDENTIALS_DIRECTORY", creds.display().to_string())],
+        );
+        let s = settings(&|k| env.get(k).cloned()).expect("settings");
+        assert_eq!(s.token, "tok");
+        env.remove("HERDR_MATRIX_TOKEN");
+        let s = settings(&|k| env.get(k).cloned()).expect("settings");
+        assert_eq!(s.token, "secret");
+        for data in ["", "\n"] {
+            fs::write(&token, data).expect("write");
+            let err = settings(&|k| env.get(k).cloned()).expect_err("empty");
+            assert_eq!(err.to_string(), format!("{}: empty", token.display()));
+        }
+        fs::remove_file(&token).expect("rm");
+        let err = settings(&|k| env.get(k).cloned()).expect_err("missing");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("{}: ", token.display())),
+            "{err}"
+        );
+        env.remove("CREDENTIALS_DIRECTORY");
+        let err = settings(&|k| env.get(k).cloned()).expect_err("no token");
+        assert_eq!(err.to_string(), "HERDR_MATRIX_TOKEN is not set");
+    }
+
+    #[test]
+    fn workspace_comes_from_the_environment_else_home() {
+        let dir = TempDir::new();
+        let env = env(
+            dir.path(),
+            &[("HERDR_MATRIX_WORKSPACE", "/srv/code".into())],
+        );
+        let bot = from_env(&|k| env.get(k).cloned()).expect("bot");
+        assert_eq!(bot.deps().workspace, Path::new("/srv/code"));
+        let env = self::env(dir.path(), &[]);
+        let bot = from_env(&|k| env.get(k).cloned()).expect("bot");
+        assert_eq!(bot.deps().workspace, dir.path().join("Workspace"));
     }
 
     #[test]

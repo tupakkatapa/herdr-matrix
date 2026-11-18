@@ -50,13 +50,37 @@ pub fn run_timed(program: &Path, args: &[&str], timeout: Duration) -> Result<Opt
         }
         thread::sleep(Duration::from_millis(5));
     };
-    // A grandchild may hold the pipes open past a timeout; it is not waited for
+    // A grandchild may hold the pipes open past the end; it is not waited for
     let Some(status) = status else {
         return Ok(None);
     };
+    while !(stdout.is_finished() && stderr.is_finished()) {
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
     Ok(Some(Ran {
         code: status.code().unwrap_or(-1),
         stdout: stdout.join().unwrap_or_default(),
         stderr: stderr.join().unwrap_or_default(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_left_holding_the_pipes_does_not_hang() {
+        let started = Instant::now();
+        let ran = run_timed(
+            Path::new("sh"),
+            &["-c", "sleep 2 & echo ok"],
+            Duration::from_millis(500),
+        )
+        .expect("started");
+        assert!(ran.is_none());
+        assert!(started.elapsed() < Duration::from_millis(1500));
+    }
 }

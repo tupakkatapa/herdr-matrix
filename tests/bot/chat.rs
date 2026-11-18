@@ -1,8 +1,8 @@
 //! The chat: onboarding, away notices, prompts, answers and commands.
 
 use crate::fakes::{BOT, OWNER, T, c, invite, ms, msg, reply_to};
-use herdr_matrix::bot::To;
-use herdr_matrix::matrix::quote;
+use herdr_matrix::bot::{AgentSettings, To};
+use herdr_matrix::matrix::{TYPING_TIMEOUT, quote};
 use herdr_matrix::state::Away;
 use serde_json::json;
 
@@ -274,6 +274,72 @@ fn answer_comes_back_while_present() {
     );
 }
 
+/// The timeouts of the bot's own syncs, from call `from` on.
+fn sync_waits(t: &T, from: usize) -> Vec<String> {
+    t.matrix.calls()[from..]
+        .iter()
+        .filter(|c| c.1 == "/sync" && !c.3.iter().any(|(k, _)| k == "user_id"))
+        .filter_map(|c| {
+            c.3.iter()
+                .find(|(k, _)| k == "timeout")
+                .map(|(_, v)| v.clone())
+        })
+        .collect()
+}
+
+#[test]
+fn answer_posts_at_the_next_tick() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    let from = t.matrix.calls().len();
+    t.set("wA:p1", "working");
+    t.bot.tick().expect("tick");
+    t.said("wA:p1", &[("u1", "old answer"), ("u2", "Answer.")], None);
+    t.set("wA:p1", "idle");
+    t.advance(0.5);
+    t.bot.tick().expect("tick");
+    assert_eq!(t.new_msgs(), ["Answer."]);
+    assert_eq!(sync_waits(&t, from), ["500", "500"]);
+}
+
+#[test]
+fn idle_tick_soon_after_a_poll_asks_herdr_nothing() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.bot.tick().expect("tick");
+    t.herdr.0.borrow_mut().calls.clear();
+    let from = t.matrix.calls().len();
+    t.advance(0.5);
+    t.bot.tick().expect("tick");
+    assert!(t.herdr.calls().is_empty(), "{:?}", t.herdr.calls());
+    assert_eq!(sync_waits(&t, from), ["3000"]);
+}
+
+#[test]
+fn idle_before_the_last_line_waits_a_poll() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.set("wA:p1", "working");
+    t.said("wA:p1", &[("u1", "old answer"), ("u2", "Looking.")], None);
+    t.bot.tick().expect("tick");
+    t.set("wA:p1", "idle");
+    t.advance(0.5);
+    t.bot.tick().expect("tick");
+    assert!(t.new_msgs().is_empty(), "{:?}", t.new_msgs());
+    t.said(
+        "wA:p1",
+        &[("u1", "old answer"), ("u2", "Looking."), ("u3", "Answer.")],
+        None,
+    );
+    t.advance(0.5);
+    t.bot.tick().expect("tick");
+    assert_eq!(t.new_msgs(), ["Looking.", "Answer."]);
+    assert_eq!(
+        t.matrix.sent_key("msgtype", None)[t.start..],
+        ["m.notice", "m.text"]
+    );
+}
+
 #[test]
 fn answer_that_went_out_quietly_notifies_at_the_end() {
     let mut t = T::new();
@@ -284,6 +350,7 @@ fn answer_that_went_out_quietly_notifies_at_the_end() {
     t.advance(21.0);
     t.poll();
     t.set("wA:p1", "idle");
+    t.poll();
     t.poll();
     assert_eq!(t.new_msgs(), ["All done.", "All done."]);
     assert_eq!(
@@ -298,9 +365,10 @@ fn exit_now_ends_the_attached_agent() {
     t.prompted("Hello");
     t.set("wA:p1", "working");
     t.poll();
+    t.tell("!exit");
     t.tell("!exit now");
     assert_eq!(t.herdr.last(), c(&["pane", "close", "wA:p1"]));
-    assert_eq!(t.last_msg(), "Closed **repo-wA**.");
+    assert_eq!(t.last_msg(), "Closed repo-wA.");
     assert_eq!(t.bot.state().attached, None);
     t.herdr.remove("wA:p1");
     t.poll();
@@ -353,12 +421,12 @@ fn stop_interrupts() {
         t.herdr.did("send-keys"),
         vec![c(&["agent", "send-keys", "wA:p1", "esc"])]
     );
-    assert_eq!(t.last_msg(), "Interrupted **repo-wA**.");
+    assert_eq!(t.last_msg(), "Interrupted repo-wA.");
     t.set("wA:p1", "idle");
     t.poll();
-    assert_eq!(t.last_msg(), "Interrupted **repo-wA**.");
+    assert_eq!(t.last_msg(), "Interrupted repo-wA.");
     t.tell("!stop");
-    assert_eq!(t.last_msg(), "**repo-wA** is not working; nothing to stop.");
+    assert_eq!(t.last_msg(), "repo-wA is not working; nothing to stop.");
     assert_eq!(t.herdr.did("send-keys").len(), 1);
 }
 
@@ -418,12 +486,12 @@ fn attach_never_sends_the_screen() {
     t.set("wA:p1", "idle");
     t.set("wB:p1", "blocked");
     t.tell("!attach repo-wA");
-    assert_eq!(t.last_msg(), "**repo-wA** attached; it is idle.");
+    assert_eq!(t.last_msg(), "repo-wA attached; it is idle.");
     t.said("wB:p1", &[], Some(crate::fakes::fruit()));
     t.tell("!attach repo-wB");
     assert!(
         t.last_msg()
-            .starts_with("**repo-wB** attached; it waits on you.\n\n**Pick a fruit?**")
+            .starts_with("repo-wB attached; it waits on you.\n\nPick a fruit?")
     );
     assert!(t.herdr.did("read").is_empty());
 }
@@ -476,7 +544,10 @@ fn new_starts_claude_in_a_folder() {
         })
         .collect();
     assert_eq!(names, ["Claude · beta"]);
-    assert!(t.last_msg().contains(&format!("Started Claude in {beta}")));
+    assert_eq!(
+        t.last_msg(),
+        format!("Started Claude Code as beta in {beta}; this chat is attached to it.")
+    );
     t.set("wN:p1", "blocked");
     t.poll();
     t.poll();
@@ -529,12 +600,31 @@ fn typing_while_the_agent_works() {
 }
 
 #[test]
+fn typing_is_sent_again_only_before_it_runs_out() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.set("wA:p1", "working");
+    let start = t.now();
+    for _ in 0..10 {
+        t.poll();
+        t.advance(0.5);
+    }
+    assert_eq!(t.matrix.typing(), [true]);
+    t.clock.set(start + TYPING_TIMEOUT.as_secs_f64() / 2.0);
+    t.poll();
+    assert_eq!(t.matrix.typing(), [true, true]);
+}
+
+#[test]
 fn attach_switches_the_chat() {
     let mut t = T::new();
     t.set("wA:p1", "idle");
     t.set("wB:p1", "idle");
     t.tell("go");
-    assert!(t.last_msg().contains("Not attached"));
+    assert!(
+        t.last_msg()
+            .starts_with("Nothing was sent: no agent is attached.")
+    );
     t.tell("!attach repo");
     assert!(
         t.last_msg()
@@ -550,17 +640,17 @@ fn attach_switches_the_chat() {
     t.said("wB:p1", &[("u1", "last words")], None);
     t.tell("!attach WB");
     assert_eq!(
-        t.last_msg(),
-        "**repo-wB** attached; it is idle.\n\nlast words"
+        t.new_msgs()[t.new_msgs().len() - 2],
+        "repo-wB attached; it is idle.\n\nlast words"
     );
     t.tell("go");
     assert_eq!(
         t.herdr.did("prompt"),
-        vec![c(&["agent", "prompt", "wB:p1", "go"])]
+        vec![c(&["agent", "prompt", "wB:p1", "go"]); 2]
     );
     t.tell("!agents");
-    assert!(t.last_msg().contains("> repo-wB  idle"));
-    assert!(t.last_msg().contains("  repo-wA  idle"));
+    assert!(t.last_msg().contains("  1. repo-wA  idle"));
+    assert!(t.last_msg().contains("> 2. repo-wB  idle"));
 }
 
 #[test]
@@ -588,6 +678,7 @@ fn attach_names_the_chat_after_the_agent() {
             json!({"membership": "join", "avatar_url": "mxc://a/b", "displayname": "Claude · repo-wB"})
         )]
     );
+    t.tell("!exit");
     t.tell("!exit now");
     let puts: Vec<_> = t
         .matrix
@@ -654,7 +745,7 @@ fn away_commands() {
         t.tell(&format!("!{word}"));
         assert_eq!(t.bot.state().away, away, "{word}");
     }
-    assert!(t.last_msg().starts_with("Here:"));
+    assert!(t.last_msg().starts_with("Away is off:"));
 }
 
 #[test]
@@ -688,10 +779,11 @@ fn help_lists_the_commands_of_the_main_chat() {
     ] {
         assert!(!help.contains(word), "{word}");
     }
-    let screen = help.split("\n\n").last().expect("a screen");
-    for line in screen.lines() {
-        assert!(line.chars().count() <= 40, "{line}");
-    }
+    let list = help.split("\n\n").next().expect("a list");
+    assert!(list.lines().all(|line| line.starts_with('!')), "{list}");
+    assert!(help.ends_with("else on the attached one."), "{help}");
+    let html = t.matrix.sent_key("formatted_body", None);
+    assert!(!html.last().expect("one").contains("<pre>"));
 }
 
 #[test]
@@ -726,7 +818,7 @@ fn answer_to_a_reply_carries_no_hint() {
     t.said("wB:p1", &[("u2", "Sure.")], None);
     t.set("wB:p1", "idle");
     t.poll();
-    assert_eq!(t.last_msg(), "**repo-wB**\n\nSure.");
+    assert_eq!(t.last_msg(), "repo-wB\n\nSure.");
 }
 
 #[test]
@@ -810,12 +902,12 @@ fn exit_asks_first() {
         assert!(!t.herdr.calls().iter().any(|c| c[0] == "pane"));
         assert_eq!(
             t.last_msg(),
-            "Send !exit now to end **repo-wA** and close its pane."
+            "Send !exit now to quit repo-wA and close its pane."
         );
     }
     t.tell("!exit now");
     assert_eq!(t.herdr.last(), c(&["pane", "close", "wA:p1"]));
-    assert_eq!(t.last_msg(), "Closed **repo-wA**.");
+    assert_eq!(t.last_msg(), "Closed repo-wA.");
 }
 
 #[test]
@@ -855,6 +947,7 @@ fn failed_profile_is_set_on_a_later_tick() {
             .any(|l| l.starts_with("error: profile"))
     );
     t.matrix.0.borrow_mut().refuse.clear();
+    t.advance(3.0);
     t.bot.tick().expect("tick");
     t.bot.tick().expect("tick");
     let puts = t
@@ -954,5 +1047,831 @@ fn attach_to_an_agent_in_an_odd_state() {
     t.set("wA:p1", "unknown");
     t.set("wB:p1", "idle");
     t.tell("!attach repo-wA");
-    assert_eq!(t.last_msg(), "**repo-wA** attached.");
+    assert_eq!(t.last_msg(), "repo-wA attached.");
+}
+
+#[test]
+fn reply_to_an_agent_that_is_gone_reaches_none() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.working_then("idle", "wB:p1");
+    let notice = t.matrix.last_id();
+    t.herdr.remove("wB:p1");
+    t.tell_with(
+        "> <@herdr:example.org> repo-wB is idle\n\nrm -rf build",
+        &reply_to(&notice),
+    );
+    assert!(t.herdr.did("prompt").is_empty());
+    assert_eq!(t.last_msg(), "That agent is not running; nothing was sent.");
+    t.tell_with("!exit now", &reply_to(&notice));
+    assert!(
+        !t.herdr
+            .calls()
+            .iter()
+            .any(|c| c[0] == "pane" && c[1] == "close"),
+        "{:?}",
+        t.herdr.last()
+    );
+    t.tell_with("hi", &reply_to("$unknown"));
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![c(&["agent", "prompt", "wA:p1", "hi"])]
+    );
+}
+
+#[test]
+fn exit_of_another_agent_keeps_the_attached_one() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.working_then("idle", "wB:p1");
+    let notice = t.matrix.last_id();
+    t.tell_with("!exit", &reply_to(&notice));
+    t.tell_with("!exit now", &reply_to(&notice));
+    assert_eq!(t.herdr.last(), c(&["pane", "close", "wB:p1"]));
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wA:p1"));
+}
+
+#[test]
+fn turn_without_text_says_it_ended() {
+    let mut t = T::new();
+    t.prompted("Delete the build dir");
+    t.set("wA:p1", "working");
+    t.poll();
+    t.set("wA:p1", "idle");
+    t.poll();
+    t.poll();
+    assert_eq!(t.new_msgs(), ["Done."]);
+    assert!(t.bot.state().pending.is_empty());
+}
+
+#[test]
+fn desk_turn_after_a_silent_turn_stays_at_the_desk() {
+    let mut t = T::new();
+    t.prompted("Delete the build dir");
+    t.set("wA:p1", "working");
+    t.poll();
+    t.set("wA:p1", "idle");
+    t.poll();
+    t.advance(120.0);
+    t.poll();
+    t.set("wA:p1", "working");
+    t.poll();
+    t.said(
+        "wA:p1",
+        &[("u1", "old answer"), ("u9", "private desk answer")],
+        None,
+    );
+    t.set("wA:p1", "idle");
+    t.poll();
+    assert!(
+        !t.new_msgs()
+            .iter()
+            .any(|m| m.contains("private desk answer")),
+        "{:?}",
+        t.new_msgs()
+    );
+}
+
+#[test]
+fn unknown_status_mid_turn_keeps_the_turn() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.set("wA:p1", "working");
+    t.said("wA:p1", &[("u1", "old answer"), ("u2", "Looking.")], None);
+    t.poll();
+    t.set("wA:p1", "unknown");
+    t.poll();
+    t.set("wA:p1", "working");
+    t.poll();
+    t.said(
+        "wA:p1",
+        &[("u1", "old answer"), ("u2", "Looking."), ("u3", "Done.")],
+        None,
+    );
+    t.set("wA:p1", "idle");
+    t.poll();
+    assert_eq!(
+        t.new_msgs().last().map(String::as_str),
+        Some("Done."),
+        "{:?}",
+        t.new_msgs()
+    );
+}
+
+#[test]
+fn new_finds_an_agent_whose_folder_ends_in_a_slash() {
+    let mut t = T::new();
+    let beta = t.dir.path().join("ws/beta");
+    std::fs::create_dir_all(&beta).expect("mkdir");
+    t.set("wA:p1", "idle");
+    t.herdr
+        .0
+        .borrow_mut()
+        .cwd
+        .insert("wA:p1".into(), format!("{}/", beta.display()));
+    t.tell("!new beta");
+    assert!(
+        t.last_msg().contains("runs there already"),
+        "{}",
+        t.last_msg()
+    );
+    assert!(
+        !t.herdr
+            .calls()
+            .iter()
+            .any(|c| c[0] == "workspace" && c[1] == "create")
+    );
+}
+
+#[test]
+fn failed_profile_is_tried_again_later() {
+    let mut t = T::new();
+    t.bot.deps_mut().avatar = Some(t.dir.path().join("missing.png"));
+    t.clear_log();
+    for _ in 0..10 {
+        t.advance(0.5);
+        t.bot.tick().expect("tick");
+    }
+    let n = t
+        .log_lines()
+        .iter()
+        .filter(|l| l.starts_with("error: profile"))
+        .count();
+    assert_eq!(n, 1, "{:?}", t.log_lines());
+}
+
+/// The names the bot took in the main chat, in order.
+fn nicks(t: &T) -> Vec<String> {
+    let path = format!(
+        "/rooms/{}/state/m.room.member/{}",
+        quote(&t.room),
+        quote(BOT)
+    );
+    t.matrix
+        .calls()
+        .into_iter()
+        .filter(|c| c.0 == "PUT" && c.1 == path)
+        .filter_map(|c| c.2?["displayname"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[test]
+fn exit_now_acts_only_on_the_agent_it_confirmed() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.working_then("idle", "wB:p1");
+    let notice = t.matrix.last_id();
+    let ask = |name: &str| format!("Send !exit now to quit {name} and close its pane.");
+    t.tell("!exit now");
+    assert_eq!(t.last_msg(), ask("repo-wA"));
+    t.tell_with("!exit now", &reply_to(&notice));
+    assert_eq!(t.last_msg(), ask("repo-wB"));
+    t.tell("!exit now");
+    assert_eq!(t.last_msg(), ask("repo-wA"));
+    t.advance(121.0);
+    t.tell("!exit now");
+    assert_eq!(t.last_msg(), ask("repo-wA"));
+    assert!(!t.herdr.calls().iter().any(|c| c[0] == "pane"));
+    t.tell("!exit now");
+    assert_eq!(t.herdr.last(), c(&["pane", "close", "wA:p1"]));
+}
+
+#[test]
+fn attached_agent_that_ends_is_let_go_once() {
+    let mut t = T::new();
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.poll();
+    t.tell("Hello");
+    t.herdr.remove("wA:p1");
+    t.poll();
+    t.tell("go");
+    assert_eq!(t.last_msg(), "repo-wA is not running; nothing was sent.");
+    assert_eq!(t.herdr.did("prompt").len(), 1);
+    let before = t.new_msgs().len();
+    for _ in 0..4 {
+        t.advance(30.0);
+        t.poll();
+    }
+    assert_eq!(
+        t.new_msgs()[before..],
+        [
+            "repo-wA ended before it answered.\nrepo-wA ended. Nothing is attached now: \
+          !attach another agent, or !new to start one."
+        ]
+    );
+    assert_eq!(
+        t.matrix
+            .sent_key("msgtype", None)
+            .last()
+            .map(String::as_str),
+        Some("m.text")
+    );
+    assert_eq!(t.bot.state().attached, None);
+    assert!(t.bot.state().pending.is_empty());
+    assert_eq!(nicks(&t).last().map(String::as_str), Some("Claude"));
+    t.tell("go");
+    assert_eq!(
+        t.herdr.did("prompt").last().expect("a prompt"),
+        &c(&["agent", "prompt", "wB:p1", "go"])
+    );
+}
+
+#[test]
+fn message_with_no_agent_attached_is_sent_once_one_is() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("go");
+    assert!(t.herdr.did("prompt").is_empty());
+    assert_eq!(
+        t.last_msg(),
+        "Nothing was sent: no agent is attached. !attach one and I send it:\n\n  \
+         1. repo-wA  idle\n  2. repo-wB  idle"
+    );
+    t.tell("!stop");
+    assert!(t.last_msg().starts_with("No agent is attached."));
+    t.tell("!attach repo-wB");
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![c(&["agent", "prompt", "wB:p1", "go"])]
+    );
+    assert_eq!(t.last_msg(), "Sent your message to repo-wB.");
+    assert_eq!(
+        t.matrix
+            .sent_key("msgtype", None)
+            .last()
+            .map(String::as_str),
+        Some("m.notice")
+    );
+    t.tell("!attach repo-wA");
+    assert_eq!(t.herdr.did("prompt").len(), 1);
+    assert!(t.herdr.did("send-keys").is_empty());
+}
+
+#[test]
+fn message_with_no_agent_running_waits_two_minutes() {
+    let mut t = T::new();
+    t.tell("go");
+    assert_eq!(
+        t.last_msg(),
+        "No agent is running, so nothing was sent. Start one with !new <folder>."
+    );
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.advance(121.0);
+    t.tell("!attach repo-wA");
+    assert!(t.herdr.did("prompt").is_empty());
+}
+
+#[test]
+fn long_answer_that_went_out_quietly_is_pointed_to() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.set("wA:p1", "working");
+    let long = "a".repeat(501);
+    t.said("wA:p1", &[("u2", &long)], None);
+    t.poll();
+    t.advance(21.0);
+    t.poll();
+    t.set("wA:p1", "idle");
+    t.poll();
+    t.poll();
+    assert_eq!(
+        t.new_msgs(),
+        [long, "repo-wA is done; its answer is above.".into()]
+    );
+    assert_eq!(
+        t.matrix.sent_key("msgtype", None)[t.start..],
+        ["m.notice", "m.text"]
+    );
+}
+
+#[test]
+fn away_shows_in_the_list_and_the_chat_name() {
+    let mut t = T::new();
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!agents");
+    assert!(t.last_msg().starts_with("Agents (away is off):"));
+    t.tell("!away");
+    assert_eq!(nicks(&t).last().map(String::as_str), Some("Claude · away"));
+    t.tell("!agents");
+    assert!(t.last_msg().starts_with("Agents (away is on):"));
+    t.tell("!attach repo-wA");
+    assert_eq!(
+        nicks(&t).last().map(String::as_str),
+        Some("Claude · repo-wA · away")
+    );
+    t.tell("!here");
+    assert_eq!(
+        nicks(&t).last().map(String::as_str),
+        Some("Claude · repo-wA")
+    );
+}
+
+#[test]
+fn new_agent_says_when_it_is_ready() {
+    let mut t = T::new();
+    std::fs::create_dir_all(t.dir.path().join("ws/beta")).expect("mkdir");
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wN".into(), "beta".into());
+    t.tell("go");
+    t.tell("!new beta");
+    t.poll();
+    t.set("wN:p1", "unknown");
+    t.poll();
+    assert!(t.herdr.did("prompt").is_empty());
+    let before = t.new_msgs().len();
+    t.set("wN:p1", "idle");
+    t.poll();
+    assert_eq!(
+        t.new_msgs()[before..],
+        ["beta is ready.", "Sent your message to beta."]
+    );
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![c(&["agent", "prompt", "wN:p1", "go"])]
+    );
+    t.poll();
+    assert_eq!(t.new_msgs().len(), before + 2);
+}
+
+#[test]
+fn new_agent_that_starts_on_a_choice_gets_the_message_once_ready() {
+    let mut t = T::new();
+    std::fs::create_dir_all(t.dir.path().join("ws/beta")).expect("mkdir");
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wN".into(), "beta".into());
+    t.tell("go");
+    t.tell("!new beta");
+    t.poll();
+    t.set("wN:p1", "blocked");
+    t.poll();
+    assert!(t.herdr.did("prompt").is_empty());
+    assert!(!t.new_msgs().contains(&"beta is ready.".to_owned()));
+    t.advance(60.0);
+    t.set("wN:p1", "idle");
+    t.poll();
+    t.poll();
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![c(&["agent", "prompt", "wN:p1", "go"])]
+    );
+    let n = t.new_msgs().len();
+    assert_eq!(
+        t.new_msgs()[n - 2..],
+        ["beta is ready.", "Sent your message to beta."]
+    );
+}
+
+#[test]
+fn message_for_a_new_agent_on_a_choice_runs_out_once() {
+    let mut t = T::new();
+    std::fs::create_dir_all(t.dir.path().join("ws/beta")).expect("mkdir");
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wN".into(), "beta".into());
+    t.tell("go");
+    t.tell("!new beta");
+    t.poll();
+    t.set("wN:p1", "blocked");
+    t.poll();
+    t.advance(121.0);
+    t.poll();
+    t.poll();
+    let said = "beta still waits on a choice; your message was not sent.";
+    let n = t.new_msgs().iter().filter(|m| *m == said).count();
+    assert_eq!(n, 1, "{:?}", t.new_msgs());
+    t.set("wN:p1", "idle");
+    t.poll();
+    assert_eq!(t.last_msg(), "beta is ready.");
+    assert!(t.herdr.did("prompt").is_empty());
+}
+
+#[test]
+fn new_agent_missing_for_a_moment_is_not_stopped() {
+    let mut t = T::new();
+    std::fs::create_dir_all(t.dir.path().join("ws/beta")).expect("mkdir");
+    t.poll();
+    t.tell("!new beta");
+    t.set("wN:p1", "unknown");
+    t.poll();
+    t.herdr.remove("wN:p1");
+    t.poll();
+    t.set("wN:p1", "idle");
+    t.poll();
+    assert!(
+        t.new_msgs().iter().all(|m| !m.contains("stopped")),
+        "{:?}",
+        t.new_msgs()
+    );
+    assert_eq!(t.last_msg(), "repo-wN is ready.");
+}
+
+#[test]
+fn files_and_text_with_no_agent_are_kept_together() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    let before = t.new_msgs().len();
+    for u in ["mxc://x/1", "mxc://x/2", "mxc://x/3"] {
+        t.tell_with("f.txt", &json!({"msgtype": "m.file", "url": u}));
+        t.advance(50.0);
+    }
+    t.tell("and this text");
+    let said = t.new_msgs()[before..].to_vec();
+    let kept = "Kept with the rest; !attach an agent and I send it.";
+    assert_eq!(said.len(), 4, "{said:?}");
+    assert!(said[0].starts_with("Nothing was sent: no agent is attached."));
+    assert_eq!(said[1..], [kept, kept, kept]);
+    assert!(
+        t.matrix.sent_key("msgtype", None)[t.matrix.sent().len() - 3..]
+            .iter()
+            .all(|m| m == "m.notice")
+    );
+    t.tell("!attach repo-wA");
+    let prompts = t.herdr.did("prompt");
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    let prompt = &prompts[0][3];
+    assert!(prompt.starts_with("and this text\n\n"), "{prompt}");
+    assert_eq!(prompt.matches("-f.txt").count(), 3, "{prompt}");
+}
+
+#[test]
+fn new_agent_that_stops_while_starting_is_said_once() {
+    let mut t = T::new();
+    std::fs::create_dir_all(t.dir.path().join("ws/beta")).expect("mkdir");
+    t.set("wA:p1", "idle");
+    t.poll();
+    t.tell("!new beta");
+    t.set("wN:p1", "unknown");
+    t.poll();
+    t.herdr.remove("wN:p1");
+    for _ in 0..5 {
+        t.advance(30.0);
+        t.poll();
+    }
+    let said: Vec<String> = t
+        .new_msgs()
+        .into_iter()
+        .filter(|m| m.contains("stopped") || m.contains("ended"))
+        .collect();
+    assert_eq!(
+        said,
+        ["beta stopped while it started. Run its command in a pane to see why."]
+    );
+    assert_eq!(t.bot.state().attached, None);
+}
+
+#[test]
+fn attach_without_a_name_takes_the_agent_replied_to() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.working_then("idle", "wB:p1");
+    let notice = t.matrix.last_id();
+    t.tell_with("!attach", &reply_to(&notice));
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wB:p1"));
+    t.tell_with("!dm", &reply_to(&notice));
+    assert!(t.bot.state().spawned.contains_key("wB:p1"));
+    t.tell_with("!leave", &reply_to(&notice));
+    assert!(t.bot.state().spawned.is_empty());
+}
+
+#[test]
+fn attach_and_dm_pick_by_number() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach");
+    assert_eq!(
+        t.last_msg(),
+        "Attach to which agent?\n\n  1. repo-wA  idle\n  2. repo-wB  idle"
+    );
+    t.tell("!attach 2");
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wB:p1"));
+    t.tell("!dm 1");
+    assert!(t.bot.state().spawned.contains_key("wA:p1"));
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wC".into(), "2".into());
+    t.set("wC:p1", "idle");
+    t.tell("!agents");
+    t.tell("!attach 2");
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wC:p1"));
+}
+
+#[test]
+fn number_of_a_gone_agent_matches_no_name() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.herdr
+        .0
+        .borrow_mut()
+        .labels
+        .insert("wC".into(), "api-v2".into());
+    t.set("wC:p1", "idle");
+    t.tell("!agents");
+    t.herdr.remove("wB:p1");
+    t.tell("!attach 2");
+    assert_eq!(t.bot.state().attached, None);
+    assert_eq!(
+        t.last_msg(),
+        "No agent 2 in the last list.\n\n  1. repo-wA  idle\n  2. api-v2  idle"
+    );
+    t.tell("!attach 2");
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wC:p1"));
+}
+
+#[test]
+fn number_without_a_list_matches_no_name() {
+    for command in ["!attach 2", "!dm 2", "!leave 2"] {
+        let mut t = T::new();
+        t.set("wA:p1", "idle");
+        t.herdr
+            .0
+            .borrow_mut()
+            .labels
+            .insert("wC".into(), "api-v2".into());
+        t.set("wC:p1", "idle");
+        t.spawn("wC:p1", "api-v2");
+        t.tell(command);
+        assert!(
+            t.last_msg().starts_with("No agent 2 in the last list."),
+            "{command}: {}",
+            t.last_msg()
+        );
+        assert_eq!(t.bot.state().attached, None);
+        assert_eq!(t.bot.state().spawned.len(), 1);
+    }
+}
+
+#[test]
+fn command_slips_are_understood() {
+    let mut t = T::new();
+    t.set("wA:p1", "working");
+    for typed in ["!stop.", "! stop", "!Stop"] {
+        t.tell(typed);
+    }
+    assert_eq!(t.herdr.did("send-keys").len(), 3);
+    t.tell("!Away");
+    assert_eq!(t.bot.state().away, Away::On);
+    t.tell("!atach repo-wA");
+    assert_eq!(
+        t.last_msg(),
+        "Unknown command !atach. Did you mean !attach?"
+    );
+    t.tell("!x");
+    assert_eq!(
+        t.last_msg(),
+        "Unknown command !x. !help lists the commands."
+    );
+}
+
+#[test]
+fn chat_texts_name_the_agent_and_what_to_do() {
+    let mut t = T::new();
+    t.set("wA:p1", "blocked");
+    t.tell("!stop");
+    assert_eq!(
+        t.last_msg(),
+        "repo-wA is not working; it waits on a choice. Answer esc to cancel it."
+    );
+    t.tell("!screen abc");
+    assert_eq!(t.last_msg(), "!screen takes a number of lines, up to 200.");
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.said("wB:p1", &[("u1", "All tests pass.")], None);
+    t.working_then("idle", "wB:p1");
+    assert_eq!(
+        t.last_msg(),
+        "repo-wB finished:\nReply to this message to answer it, or !attach repo-wB.\n\n\
+         All tests pass."
+    );
+    assert!(
+        t.matrix
+            .sent_key("formatted_body", None)
+            .last()
+            .expect("one")
+            .starts_with("<b>repo-wB</b> finished:")
+    );
+    t.herdr
+        .0
+        .borrow_mut()
+        .screens
+        .insert("wB:p1".into(), crate::fakes::PERMISSION.into());
+    t.set("wB:p1", "working");
+    t.poll();
+    t.set("wB:p1", "blocked");
+    t.poll();
+    assert!(
+        t.last_msg().starts_with("repo-wB asks:"),
+        "{}",
+        t.last_msg()
+    );
+    let choice = t.matrix.last_id();
+    t.herdr.remove("wB:p1");
+    t.react(&choice, "\u{1F44D}");
+    assert_eq!(t.last_msg(), "That agent no longer waits on that choice.");
+}
+
+#[test]
+fn welcome_says_what_to_do_first() {
+    let t = T::new();
+    let welcome = t.matrix.sent();
+    let first = welcome.first().expect("a welcome");
+    assert!(first.starts_with("!agents - list the agents\n"), "{first}");
+    assert!(
+        first.ends_with(
+            "No agent is running. Start one with !new <folder>; !new lists the folders."
+        ),
+        "{first}"
+    );
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.queue(invite("!one:example.org", OWNER));
+    t.sync();
+    assert!(
+        t.last_msg().ends_with("Write here to talk to repo-wA."),
+        "{}",
+        t.last_msg()
+    );
+    t.set("wB:p1", "idle");
+    t.queue(invite("!two:example.org", OWNER));
+    t.sync();
+    assert!(
+        t.last_msg()
+            .contains("!attach one of them to start.\n\n  1. repo-wA  idle\n  2. repo-wB  idle"),
+        "{}",
+        t.last_msg()
+    );
+}
+
+/// `ws/beta`, whose agent starts when the bot comes up; its path.
+fn autostarting(t: &mut T) -> String {
+    let beta = t.dir.path().join("ws/beta");
+    std::fs::create_dir_all(&beta).expect("mkdir");
+    let beta = beta.to_string_lossy().into_owned();
+    t.bot.deps_mut().agents = vec![AgentSettings {
+        cwd: beta.clone(),
+        autostart: true,
+        ..AgentSettings::default()
+    }];
+    beta
+}
+
+fn workspaces_made(t: &T) -> Vec<Vec<String>> {
+    t.herdr
+        .calls()
+        .into_iter()
+        .filter(|c| c[0] == "workspace" && c[1] == "create")
+        .collect()
+}
+
+#[test]
+fn autostart_starts_an_agent_once() {
+    let mut t = T::new();
+    let beta = autostarting(&mut t);
+    t.poll();
+    assert!(workspaces_made(&t).is_empty());
+    t.poll();
+    t.poll();
+    assert_eq!(
+        workspaces_made(&t),
+        [c(&[
+            "workspace",
+            "create",
+            "--cwd",
+            &beta,
+            "--label",
+            "beta",
+            "--no-focus"
+        ])]
+    );
+    assert!(
+        t.herdr
+            .calls()
+            .contains(&c(&["pane", "run", "wN:p1", "claude"]))
+    );
+    assert_eq!(t.bot.state().attached, None);
+    t.set("wN:p1", "idle");
+    t.herdr.0.borrow_mut().cwd.insert("wN:p1".into(), beta);
+    t.poll();
+    assert_eq!(t.last_msg(), "repo-wN is ready.");
+    t.tell("!exit");
+    t.tell("!exit now");
+    assert!(t.herdr.calls().contains(&c(&["pane", "close", "wN:p1"])));
+    t.herdr.remove("wN:p1");
+    for _ in 0..3 {
+        t.advance(30.0);
+        t.poll();
+    }
+    assert_eq!(workspaces_made(&t).len(), 1);
+}
+
+#[test]
+fn autostart_leaves_a_running_agent_alone() {
+    let mut t = T::new();
+    let beta = autostarting(&mut t);
+    t.set("wA:p1", "idle");
+    t.herdr
+        .0
+        .borrow_mut()
+        .cwd
+        .insert("wA:p1".into(), format!("{beta}/"));
+    for _ in 0..3 {
+        t.poll();
+    }
+    assert!(workspaces_made(&t).is_empty());
+    t.herdr.remove("wA:p1");
+    t.poll();
+    t.poll();
+    assert!(workspaces_made(&t).is_empty());
+    t.herdr.0.borrow_mut().fail = 1;
+    assert!(t.bot.poll().is_err());
+    t.poll();
+    assert!(workspaces_made(&t).is_empty());
+    t.poll();
+    assert_eq!(workspaces_made(&t).len(), 1);
+}
+
+#[test]
+fn autostart_waits_for_herdr_to_list() {
+    let mut t = T::new();
+    autostarting(&mut t);
+    t.herdr.0.borrow_mut().fail = 1;
+    assert!(t.bot.poll().is_err());
+    t.poll();
+    assert!(workspaces_made(&t).is_empty());
+    t.poll();
+    assert_eq!(workspaces_made(&t).len(), 1);
+}
+
+#[test]
+fn autostart_that_stops_while_starting_is_said_once() {
+    let mut t = T::new();
+    autostarting(&mut t);
+    t.poll();
+    t.poll();
+    t.set("wN:p1", "unknown");
+    t.poll();
+    t.herdr.remove("wN:p1");
+    for _ in 0..5 {
+        t.advance(30.0);
+        t.poll();
+    }
+    let said: Vec<String> = t
+        .new_msgs()
+        .into_iter()
+        .filter(|m| m.contains("stopped") || m.contains("ended"))
+        .collect();
+    assert_eq!(
+        said,
+        ["beta stopped while it started. Run its command in a pane to see why."]
+    );
+    assert_eq!(workspaces_made(&t).len(), 1);
+}
+
+#[test]
+fn autostart_skips_a_missing_folder() {
+    let mut t = T::new();
+    let gone = t.dir.path().join("ws/gone").to_string_lossy().into_owned();
+    t.bot.deps_mut().agents = vec![AgentSettings {
+        cwd: gone.clone(),
+        autostart: true,
+        ..AgentSettings::default()
+    }];
+    for _ in 0..3 {
+        t.poll();
+    }
+    assert!(workspaces_made(&t).is_empty());
+    let lines: Vec<String> = t
+        .log_lines()
+        .into_iter()
+        .filter(|l| l.contains(&gone))
+        .collect();
+    assert_eq!(lines, [format!("autostart {gone}: no such folder")]);
 }

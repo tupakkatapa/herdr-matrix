@@ -4,21 +4,19 @@
 //! the bot's chats.
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::io::{BufRead as _, BufReader, Read, Write};
-use std::path::Path;
 use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::app::safe_url;
+use crate::app::{credential, safe_url};
 use crate::files::random_name;
 use crate::matrix::{Api as _, As, DEFAULT_TIMEOUT, Http, Matrix, member, present, quote};
 use crate::{Error, Result};
 
-/// Most messages one request walks through
+/// Most events one request walks through
 pub const CAP: usize = 5000;
 /// Most events one page asks for
 const PAGE: usize = 100;
@@ -160,6 +158,7 @@ fn after<'a>(local: &'a str, prefix: &str) -> Option<&'a str> {
 struct Walk {
     found: Vec<Value>,
     hidden: usize,
+    walked: usize,
     token: Option<String>,
     more: bool,
 }
@@ -174,6 +173,7 @@ impl Walk {
             .unwrap_or_default();
         self.token = page.get("end").and_then(Value::as_str).map(str::to_owned);
         self.more = self.token.is_some() && !chunk.is_empty();
+        self.walked += chunk.len();
         for event in chunk {
             let Some(stamp) = event.get("origin_server_ts").and_then(Value::as_i64) else {
                 continue;
@@ -242,6 +242,9 @@ impl<M: Matrix> Gate<M> {
     }
 
     fn serves(&mut self, room: &str) -> Result<bool> {
+        if !self.rules.shows(room) {
+            return Ok(false);
+        }
         let path = format!("/rooms/{}/members", quote(room));
         let resp = self.matrix.call("GET", &path, None, &[], DEFAULT_TIMEOUT)?;
         let members: Vec<(&str, &str)> = resp
@@ -251,7 +254,7 @@ impl<M: Matrix> Gate<M> {
             .flatten()
             .filter_map(member)
             .collect();
-        Ok(self.rules.serves(&members, &self.server) && self.rules.shows(room))
+        Ok(self.rules.serves(&members, &self.server))
     }
 
     fn check(&mut self, room: &str) -> Result<()> {
@@ -314,11 +317,15 @@ impl<M: Matrix> Gate<M> {
         let mut walk = Walk {
             found: Vec::new(),
             hidden: 0,
+            walked: 0,
             token: from.map(str::to_owned),
             more: true,
         };
-        while walk.more && walk.found.len() < limit {
-            let want = PAGE.min(limit - walk.found.len()).to_string();
+        while walk.more && walk.found.len() < limit && walk.walked < CAP {
+            let want = PAGE
+                .min(limit - walk.found.len())
+                .min(CAP - walk.walked)
+                .to_string();
             let token = walk.token.take();
             let mut query = vec![("dir", "b"), ("limit", want.as_str()), ("filter", FILTER)];
             if let Some(token) = &token {
@@ -672,17 +679,6 @@ fn settings(env: &dyn Fn(&str) -> Option<String>) -> Result<(String, Rules)> {
     ))
 }
 
-/// The owner's token: the credential `token` that systemd passes.
-fn token(env: &dyn Fn(&str) -> Option<String>) -> Result<String> {
-    let dir = env("CREDENTIALS_DIRECTORY")
-        .ok_or_else(|| Error::Setting("CREDENTIALS_DIRECTORY is not set".into()))?;
-    let token = fs::read_to_string(Path::new(&dir).join("token"))?;
-    match token.trim() {
-        "" => Err(Error::Setting("the token is empty".into())),
-        token => Ok(token.to_owned()),
-    }
-}
-
 /// The arguments of a request, a JSON line `{"argv": [...]}`.
 fn argv(input: &mut dyn Read) -> Result<Vec<String>> {
     let mut line = String::new();
@@ -699,7 +695,8 @@ fn argv(input: &mut dyn Read) -> Result<Vec<String>> {
 fn answer(env: &dyn Fn(&str) -> Option<String>, argv: &[String]) -> Result<Value> {
     let request = parse(argv, now_ms())?;
     let (homeserver, rules) = settings(env)?;
-    let mut matrix = Http::new(&homeserver, &token(env)?);
+    // The owner's token, which systemd passes
+    let mut matrix = Http::new(&homeserver, &credential(env, "token")?);
     let me = matrix.whoami()?;
     Gate::new(matrix, &me, rules).run(&request)
 }
@@ -772,6 +769,7 @@ mod tests {
         names: Vec<(&'static str, &'static str)>,
         events: Vec<Value>,
         sent: Vec<(String, Value)>,
+        paths: Vec<String>,
     }
 
     const BRIDGED: &[(&str, &str)] = &[("@me:x", "join"), ("@signal_1:x", "join")];
@@ -788,6 +786,7 @@ mod tests {
                 names: vec![("!r", "Friend")],
                 events,
                 sent: Vec::new(),
+                paths: Vec::new(),
             },
             ME,
             rules(),
@@ -803,6 +802,7 @@ mod tests {
             query: &[(&str, &str)],
             _timeout: std::time::Duration,
         ) -> Result<Value> {
+            self.paths.push(path.to_owned());
             let room = |suffix: &str| {
                 self.rooms
                     .iter()
@@ -822,6 +822,13 @@ mod tests {
                     })
                     .collect();
                 return Ok(json!({ "chunk": chunk }));
+            }
+            if path.ends_with("/members") {
+                return Err(Error::Http {
+                    status: 403,
+                    code: "M_FORBIDDEN".into(),
+                    body: Vec::new(),
+                });
             }
             if let Some((id, _)) = room("/state/m.room.name/") {
                 return match self.names.iter().find(|(r, _)| *r == id) {
@@ -1089,6 +1096,32 @@ mod tests {
     }
 
     #[test]
+    fn walk_stops_at_the_cap_of_events() {
+        let events: Vec<Value> = (0..12_000)
+            .map(|i| event(12_000 - i, None, "m.room.encrypted"))
+            .collect();
+        let mut secret = fake(events);
+        for (argv, page) in [
+            (&["read", "!r"][..], COUNT),
+            (&["read", "!r", "--since", "1970-01-01"], PAGE),
+        ] {
+            secret.matrix.paths.clear();
+            let err = answer(&mut secret, argv).expect_err("encrypted");
+            assert_eq!(
+                err.to_string(),
+                format!("the room is encrypted: {CAP} messages the gate cannot read")
+            );
+            let pages = secret
+                .matrix
+                .paths
+                .iter()
+                .filter(|p| p.ends_with("/messages"))
+                .count();
+            assert_eq!(pages, CAP / page, "{argv:?}");
+        }
+    }
+
+    #[test]
     fn mixed_room_counts_what_it_cannot_read() {
         let mut mixed = fake(vec![
             message(2, Some("plain")),
@@ -1205,6 +1238,17 @@ mod tests {
     }
 
     #[test]
+    fn rooms_outside_the_list_ask_the_homeserver_nothing() {
+        let mut gate = fake(Vec::new());
+        gate.rules.rooms = Some(vec!["!r".into()]);
+        for room in ["!h", "!gone"] {
+            let err = answer(&mut gate, &["read", room]).expect_err("refused");
+            assert_eq!(err.to_string(), "not a bridged chat", "{room}");
+        }
+        assert!(gate.matrix.paths.is_empty(), "{:?}", gate.matrix.paths);
+    }
+
+    #[test]
     fn bad_arguments_name_the_usage() {
         let mut room = room();
         for argv in [
@@ -1311,7 +1355,10 @@ mod tests {
         let dir = crate::testutil::TempDir::new();
         std::fs::write(dir.path().join("token"), "tok\n").expect("write");
         let creds = dir.path().display().to_string();
-        assert_eq!(token(&|_| Some(creds.clone())).expect("token"), "tok");
-        assert!(token(&|_| None).is_err());
+        assert_eq!(
+            credential(&|_| Some(creds.clone()), "token").expect("token"),
+            "tok"
+        );
+        assert!(credential(&|_| None, "token").is_err());
     }
 }

@@ -64,7 +64,9 @@ pub(super) fn parse(text: &str) -> Turn {
                         .map(str::to_owned);
                     asked.shift_remove(&id);
                 }
-                if !flag(&entry, "isMeta")
+                // Entries Claude Code writes in the user's place
+                let injected = ["isMeta", "isCompactSummary", "isVisibleInTranscriptOnly"];
+                if !injected.iter().any(|name| flag(&entry, name))
                     && (content.is_some_and(Value::is_string)
                         || blocks.iter().any(|b| kind(b).as_deref() == Some("text")))
                 {
@@ -247,6 +249,23 @@ mod tests {
                 "tail {tail}"
             );
         }
+    }
+
+    #[test]
+    fn compaction_summary_does_not_start_a_turn() {
+        let text: String = [
+            json!({"type": "user", "message": {"content": "Hello"}}),
+            json!({"type": "assistant", "uuid": "a1", "message": {"content": [{"type": "text", "text": "Found it."}]}}),
+            json!({"type": "system", "subtype": "compact_boundary"}),
+            json!({"type": "user", "isCompactSummary": true, "isVisibleInTranscriptOnly": true,
+                   "message": {"content": "This session is being continued..."}}),
+            json!({"type": "user", "isVisibleInTranscriptOnly": true,
+                   "message": {"content": [{"type": "text", "text": "shown"}]}}),
+        ]
+        .iter()
+        .map(|l| l.to_string() + "\n")
+        .collect();
+        assert_eq!(parse(&text), expect(&[("a1", "Found it.")], None));
     }
 
     #[test]

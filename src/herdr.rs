@@ -146,6 +146,7 @@ impl Default for RunHerdr {
 impl Herdr for RunHerdr {
     fn run(&mut self, args: &[&str]) -> Result<(i32, String)> {
         Ok(match run_timed(&self.program, args, self.timeout)? {
+            Some(ran) if ran.code != 0 && ran.stdout.trim().is_empty() => (ran.code, ran.stderr),
             Some(ran) => (ran.code, ran.stdout),
             None => (
                 1,

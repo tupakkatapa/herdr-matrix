@@ -1,9 +1,15 @@
 //! The owner's `!` commands.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use super::contacts::Why;
-use super::{Bot, Post, SCREEN_LINES, SCREEN_MAX, To, same_dir};
+use super::{
+    AgentSettings, Bot, FOLLOW_UP, Post, RETRY_MAX, SCREEN_LINES, SCREEN_MAX, Starting, To, due,
+    herdr_failed, not_running, same_dir,
+};
 use crate::Result;
-use crate::commands::{Cmd, HELP, Place, command, contact, helps};
+use crate::commands::{Cmd, HELP, Place, command, contact, helps, suggest};
 use crate::files;
 use crate::herdr::{self, Agent, Status, Turn};
 use crate::matrix::Inbound;
@@ -33,11 +39,11 @@ impl Bot {
             Place::Main
         };
         let Some(entry) = command(&word[1..]) else {
-            let help = helps(place);
-            self.say(
-                &format!("Unknown command {word}. Commands:"),
-                to.screen(&help),
-            )?;
+            let said = match suggest(&word[1..], place) {
+                Some(near) => format!("Unknown command {word}. Did you mean !{near}?"),
+                None => format!("Unknown command {word}. !help lists the commands."),
+            };
+            self.say(&said, to)?;
             return Ok(());
         };
         if entry.help(place).is_none() {
@@ -46,8 +52,14 @@ impl Bot {
             return Ok(());
         }
         let a = if entry.cmd.acts() {
-            let Some(a) = mine.or_else(|| self.target(ev, agents)) else {
-                return self.ask_which("Not attached. !attach one of:", agents);
+            if let Some(contact) = contact.filter(|_| mine.is_none()) {
+                let name = self.chat_agent_name(contact);
+                self.say(&not_running(name.as_deref()), to)?;
+                return Ok(());
+            }
+            let Some(a) = mine.map_or_else(|| self.target(ev, agents, None), |a| Ok(Some(a)))?
+            else {
+                return Ok(());
             };
             self.log(&format!("{} {word}", a.pane_id));
             Some(a)
@@ -56,12 +68,27 @@ impl Bot {
             None
         };
         let agent = || a.expect("an acting command has its agent");
+        let replied = ev
+            .reply_to
+            .as_ref()
+            .and_then(|q| self.state.sent.get(q))
+            .cloned();
+        let replied = replied.as_deref();
+        let kill =
+            (word == "!kill").then_some("!kill closes the chat; to quit the agent, use !exit.");
         match entry.cmd {
-            Cmd::Agents => self.ask_which("Agents:", agents)?,
-            Cmd::Attach => self.attach(rest, agents)?,
+            Cmd::Agents => {
+                let head = if self.away() {
+                    "Agents (away is on):"
+                } else {
+                    "Agents (away is off):"
+                };
+                self.ask_which(head, agents)?;
+            }
+            Cmd::Attach => self.attach(rest, agents, replied)?,
             Cmd::New => self.new_agent(rest, agents)?,
-            Cmd::Dm => self.open_chat(rest, agents)?,
-            Cmd::Leave => self.leave(rest, agents, chat, contact)?,
+            Cmd::Dm => self.open_chat(rest, agents, replied)?,
+            Cmd::Leave => self.leave(rest, agents, chat, contact, replied, kill)?,
             Cmd::Last => self.last(agent(), to)?,
             Cmd::Screen => self.screen(agent(), rest, to)?,
             Cmd::Stop => self.stop(agent(), to)?,
@@ -69,14 +96,14 @@ impl Bot {
             Cmd::Away => {
                 self.set_away(
                     Away::On,
-                    "Away: every agent that stops or waits posts here. !here ends it.",
+                    "Away is on: every agent that stops or asks posts here. !here turns it off.",
                     to,
                 )?;
             }
             Cmd::Here => {
                 self.set_away(
                     Away::Off,
-                    "Here: only replies to what you send from the chat post here.",
+                    "Away is off: only answers to what you send from here come here.",
                     to,
                 )?;
             }
@@ -85,9 +112,12 @@ impl Bot {
         Ok(())
     }
 
+    /// Turns away on or off; the main chat's name shows it.
     fn set_away(&mut self, away: Away, said: &str, to: To) -> Result<()> {
         self.state.away = away;
         self.save()?;
+        let name = self.attached_name().map(str::to_owned);
+        self.nicked = self.retry("nick", RETRY_MAX, |bot| bot.nick(name.as_deref()));
         self.say(said, to)?;
         Ok(())
     }
@@ -103,11 +133,15 @@ impl Bot {
     }
 
     fn screen(&mut self, a: &Agent, rest: &str, to: To) -> Result<()> {
-        let lines = if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
-            rest.parse::<u64>()
-                .map_or(SCREEN_MAX, |n| n.min(SCREEN_MAX))
-        } else {
+        let lines = if rest.is_empty() {
             SCREEN_LINES
+        } else if rest.chars().all(|c| c.is_ascii_digit()) {
+            rest.parse::<u64>()
+                .map_or(SCREEN_MAX, |n| n.clamp(1, SCREEN_MAX))
+        } else {
+            let said = format!("!screen takes a number of lines, up to {SCREEN_MAX}.");
+            self.say(&said, to)?;
+            return Ok(());
         };
         let screen = self.read(&a.pane_id, lines)?;
         self.say(
@@ -120,7 +154,14 @@ impl Bot {
     fn stop(&mut self, a: &Agent, to: To) -> Result<()> {
         let to = to.pane(&a.pane_id);
         if a.status != Status::Working {
-            let said = format!("**{}** is not working; nothing to stop.", a.name);
+            let said = if a.status == Status::Blocked {
+                format!(
+                    "**{}** is not working; it waits on a choice. Answer esc to cancel it.",
+                    a.name
+                )
+            } else {
+                format!("**{}** is not working; nothing to stop.", a.name)
+            };
             self.say(&said, to)?;
             return Ok(());
         }
@@ -128,7 +169,7 @@ impl Bot {
         self.done(&a.pane_id)?;
         let said = match sent {
             Ok(()) => format!("Interrupted **{}**.", a.name),
-            Err(crate::Error::Herdr(out)) => format!("Could not stop **{}**: {out}", a.name),
+            Err(crate::Error::Herdr(out)) => herdr_failed("stop", &a.name, &out),
             Err(err) => return Err(err),
         };
         self.say(&said, to)?;
@@ -140,17 +181,15 @@ impl Bot {
             Place::Own => contact(a.map_or("", |a| a.name.as_str())),
             Place::Main => HELP.to_owned(),
         };
-        self.say(&text, to.screen(&helps(place)))?;
+        self.say(&format!("{}\n\n{text}", helps(place)), to)?;
         Ok(())
     }
 
-    fn attach(&mut self, rest: &str, agents: &[Agent]) -> Result<()> {
-        let Some(a) = self.pick(rest, agents, "Attach to which")? else {
+    fn attach(&mut self, rest: &str, agents: &[Agent], replied: Option<&str>) -> Result<()> {
+        let Some(a) = self.pick(rest, agents, "Attach to which", replied)? else {
             return Ok(());
         };
-        self.state.attached = Some(a.pane_id.clone());
-        self.save()?;
-        self.nick(Some(&a.name))?;
+        self.attach_to(a)?;
         let turn = self.turn(a);
         let mut said = turn.messages.last().map(|(_, t)| t.clone());
         let asks = turn
@@ -180,11 +219,11 @@ impl Bot {
             );
             self.save()?;
         }
-        Ok(())
+        self.send_kept(a, agents)
     }
 
-    /// Ends an agent and closes its pane; asks first, and acts only on
-    /// `now`.
+    /// Quits an agent and closes its pane; asks first, and acts only on
+    /// `now` for the agent it asked about lately.
     fn exit(
         &mut self,
         a: &Agent,
@@ -194,22 +233,30 @@ impl Bot {
     ) -> Result<()> {
         let pane = a.pane_id.as_str();
         let to = To::chat(chat).pane(pane);
-        if rest.to_lowercase() != "now" {
-            let said = format!("Send !exit now to end **{}** and close its pane.", a.name);
+        let now = self.now();
+        let confirmed = rest.to_lowercase() == "now"
+            && self
+                .exit_asked
+                .as_ref()
+                .is_some_and(|(asked, at)| asked == pane && !due(now, *at, FOLLOW_UP));
+        if !confirmed {
+            self.exit_asked = Some((pane.to_owned(), now));
+            let said = format!("Send !exit now to quit **{}** and close its pane.", a.name);
             self.say(&said, to)?;
             return Ok(());
         }
         match herdr::close_pane(self.deps.herdr.as_mut(), pane) {
             Err(crate::Error::Herdr(out)) => {
-                self.say(&format!("Could not close **{}**: {out}", a.name), to)?;
+                self.say(&herdr_failed("close", &a.name, &out), to)?;
                 return Ok(());
             }
             other => other?,
         }
+        self.exit_asked = None;
         self.done(pane)?;
-        if contact.is_none() || self.state.attached.as_deref() == Some(pane) {
+        if self.state.attached.as_deref() == Some(pane) {
             self.state.attached = None;
-            self.nick(None)?;
+            self.nicked = self.retry("nick", RETRY_MAX, |bot| bot.nick(None));
         }
         self.save()?;
         self.say(&format!("Closed **{}**.", a.name), To::chat(chat))?;
@@ -259,20 +306,60 @@ impl Bot {
         let path = &dirs[0];
         if let Some(running) = agents
             .iter()
-            .find(|a| a.cwd.as_deref() == Some(path.as_str()))
+            .find(|a| a.cwd.as_deref().is_some_and(|cwd| same_dir(cwd, path)))
         {
-            self.state.attached = Some(running.pane_id.clone());
-            self.save()?;
-            self.nick(Some(&running.name))?;
+            self.attach_to(running)?;
             self.post(
                 running,
                 "runs there already; attached.",
                 Post::new(&[], None).no_screen(),
             )?;
-            return Ok(());
+            return self.send_kept(running, agents);
         }
+        let settings = match settings_at(&self.deps.agents, path) {
+            Ok(settings) => settings.cloned(),
+            Err((id, cwd)) => {
+                let its = cwd
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default();
+                let said = format!(
+                    "**{path}** is inside the folder of the confined agent **{id}**; start it with !new {its}."
+                );
+                self.say(&said, To::default())?;
+                return Ok(());
+            }
+        };
+        let (pane, label) = self.start(path, settings.as_ref())?;
+        let kind = settings.map(|s| s.kind).unwrap_or_default();
+        self.state.attached = Some(pane.clone());
+        self.attached_name = Some((pane.clone(), label.clone()));
+        self.save()?;
+        self.nicked = self.retry("nick", RETRY_MAX, |bot| bot.nick(Some(&label)));
+        self.expect(
+            &pane,
+            &Turn::default(),
+            Origin {
+                started: true,
+                ..Origin::default()
+            },
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        let said = format!(
+            "Started {kind} as **{label}** in {}; this chat is attached to it.",
+            tilde(path, &home)
+        );
+        self.say(&said, To::default())?;
+        Ok(())
+    }
+
+    /// Starts an agent in `path`, as its settings say: a new workspace,
+    /// then the command of a confined agent, else the program of its kind.
+    /// The pane is followed until the agent is ready, and holds the own
+    /// chat of a configured agent. Its pane and label.
+    fn start(&mut self, path: &str, settings: Option<&AgentSettings>) -> Result<(String, String)> {
         let label = path.rsplit('/').next().unwrap_or_default().to_owned();
-        let settings = self.deps.agents.iter().find(|s| same_dir(&s.cwd, path));
         let kind = settings.map(|s| s.kind.clone()).unwrap_or_default();
         // The shell left after a confined agent would not be confined
         let command = settings.and_then(|s| s.sandbox.as_ref()).map_or_else(
@@ -282,21 +369,105 @@ impl Bot {
         let herdr = self.deps.herdr.as_mut();
         let pane = herdr::create_workspace(herdr, path, &label)?;
         herdr::run_in_pane(herdr, &pane, &command)?;
-        self.state.attached = Some(pane.clone());
-        self.save()?;
-        self.nick(Some(&label))?;
-        self.expect(
-            &pane,
-            &Turn::default(),
-            Origin {
-                started: true,
-                ..Origin::default()
-            },
-        )?;
-        self.say(
-            &format!("Started {kind} in {path}. This chat is attached to it."),
-            To::default(),
-        )?;
-        Ok(())
+        let starting = Starting {
+            folder: label.clone(),
+            at: self.now(),
+            seen: false,
+            missing: None,
+        };
+        self.starting.insert(pane.clone(), starting);
+        if let Some(s) = settings {
+            self.started_for.insert(pane.clone(), (s.cwd.clone(), None));
+        }
+        Ok((pane, label))
+    }
+
+    /// Starts each agent set to start that does not run in its folder, once
+    /// in a run of the bot; the main chat stays as it is.
+    pub(super) fn autostart(&mut self, agents: &[Agent]) {
+        let due: Vec<String> = self
+            .deps
+            .agents
+            .iter()
+            .filter(|s| s.autostart && !self.autostarted.contains(&s.cwd))
+            .filter(|s| {
+                !agents
+                    .iter()
+                    .any(|a| a.cwd.as_deref().is_some_and(|cwd| same_dir(cwd, &s.cwd)))
+            })
+            .map(|s| s.cwd.clone())
+            .collect();
+        for cwd in due {
+            let path = cwd.strip_suffix('/').unwrap_or(&cwd);
+            if !Path::new(path).is_dir() {
+                self.log(&format!("autostart {cwd}: no such folder"));
+                continue;
+            }
+            self.autostarted.insert(cwd.clone());
+            let settings = match settings_at(&self.deps.agents, path) {
+                Ok(settings) => settings.cloned(),
+                Err((id, _)) => {
+                    let said =
+                        format!("autostart {cwd}: inside the folder of the confined agent {id}");
+                    self.log(&said);
+                    continue;
+                }
+            };
+            match self.start(path, settings.as_ref()) {
+                Ok((pane, _)) => self.log(&format!("{pane} autostarted in {cwd}")),
+                Err(err) => self.log(&format!("error: autostart {cwd}: {err}")),
+            }
+        }
+    }
+}
+
+/// A path with the home directory in it as `~`.
+fn tilde(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
+        _ => path.to_owned(),
+    }
+}
+
+/// The settings of the agent working in `path`, as written or with
+/// symlinks resolved. Err with the id and `cwd` of a confined agent whose
+/// folder holds `path`: that agent writes there, and could have made it a
+/// link anywhere.
+fn settings_at<'a>(
+    agents: &'a [AgentSettings],
+    path: &str,
+) -> std::result::Result<Option<&'a AgentSettings>, (&'a str, &'a str)> {
+    let resolved = |p: &str| fs::canonicalize(p).unwrap_or_else(|_| p.into());
+    let paths = [PathBuf::from(path), resolved(path)];
+    for s in agents {
+        let Some(sandbox) = &s.sandbox else { continue };
+        let cwds = [PathBuf::from(&s.cwd), resolved(&s.cwd)];
+        let inside = paths
+            .iter()
+            .any(|p| cwds.iter().any(|cwd| p.starts_with(cwd) && p != cwd));
+        if inside && !cwds.contains(&paths[1]) {
+            return Err((&sandbox.id, &s.cwd));
+        }
+    }
+    Ok(agents
+        .iter()
+        .find(|s| same_dir(&s.cwd, path) || resolved(&s.cwd) == paths[1]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn home_is_shown_as_a_tilde() {
+        assert_eq!(
+            tilde("/home/kari/Workspace/a", "/home/kari"),
+            "~/Workspace/a"
+        );
+        assert_eq!(tilde("/home/kari", "/home/kari"), "~");
+        assert_eq!(tilde("/home/karin/a", "/home/kari"), "/home/karin/a");
+        assert_eq!(tilde("/w/a", ""), "/w/a");
     }
 }

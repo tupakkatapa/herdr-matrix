@@ -149,7 +149,8 @@ fn state_file_with_every_key_round_trips() {
         "sent": {"$e1": "wA:p1", "$e0": "wB:p1"},
         "asked": {"wA:p1": ["$e1", "ab12"], "wB:p1": [null, null]},
         "talk": true,
-        "spawned": {"wG:p1": {"user": "@herdr_a:example.org", "room": "!u:example.org", "since": "46240"}},
+        "spawned": {"wG:p1": {"user": "@herdr_a:example.org", "room": "!u:example.org", "since": "46240",
+                               "agent": "/w/g"}},
         "avatars": {"c81e": "mxc://example.org/pic"},
         "rooms": {}, "target": {"!m:example.org": "wF:p1"}
     });
@@ -222,4 +223,63 @@ fn older_entries_load() {
     assert_eq!(after["talk"], true);
     assert_eq!(after["pending"]["wA:p1"]["voice"], "en");
     assert!(after["pending"]["wA:p1"].get("last").is_none());
+}
+
+#[test]
+fn away_restart_does_not_post_a_choice_again() {
+    let mut t = T::new();
+    t.tell("!afk");
+    t.set("wA:p1", "working");
+    t.poll();
+    t.set("wA:p1", "blocked");
+    t.poll();
+    let before = t.matrix.sent().len();
+    t.bot = t.make();
+    t.poll();
+    t.poll();
+    assert_eq!(
+        t.matrix.sent().len(),
+        before,
+        "posted again: {:?}",
+        &t.matrix.sent()[before..]
+    );
+}
+
+#[test]
+fn restart_names_the_chat_after_the_attached_agent() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.tell("!attach repo-wB");
+    let path = format!(
+        "/rooms/{}/state/m.room.member/{}",
+        herdr_matrix::matrix::quote(&t.room),
+        herdr_matrix::matrix::quote(crate::fakes::BOT)
+    );
+    let names = |t: &T| -> Vec<String> {
+        t.matrix
+            .calls()
+            .into_iter()
+            .filter(|c| c.0 == "PUT" && c.1 == path)
+            .map(|c| {
+                c.2.expect("body")["displayname"]
+                    .as_str()
+                    .expect("a name")
+                    .to_owned()
+            })
+            .collect()
+    };
+    let before = names(&t).len();
+    t.bot = t.make();
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.herdr.remove("wB:p1");
+    t.bot.tick().expect("tick");
+    assert_eq!(names(&t)[before..], ["Claude"]);
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wB:p1"));
+    t.set("wB:p1", "idle");
+    t.bot = t.make();
+    t.bot.deps_mut().name = Some("Claude".into());
+    t.bot.tick().expect("tick");
+    assert_eq!(names(&t)[before..], ["Claude", "Claude · repo-wB"]);
 }

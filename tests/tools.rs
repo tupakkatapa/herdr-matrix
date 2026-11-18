@@ -86,6 +86,29 @@ fn whisper_takes_a_language() {
 }
 
 #[test]
+fn ffmpeg_opens_local_files_only() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let args = dir.path().join("args");
+    script(
+        dir.path(),
+        "ffmpeg",
+        &format!("printf '%s\\n' \"$@\" > {}\n{FFMPEG}", args.display()),
+    );
+    script(dir.path(), "whisper-cli", "echo Hello");
+    whisper(&bins(dir.path()), &audio(dir.path()), "model", "auto").expect("whisper");
+    let args = fs::read_to_string(&args).expect("args");
+    let args: Vec<&str> = args.lines().collect();
+    let input = args.iter().position(|a| *a == "-i").expect("an input");
+    assert!(
+        args[..input]
+            .windows(2)
+            .any(|w| w == ["-protocol_whitelist", "file,pipe"]),
+        "{args:?}"
+    );
+}
+
+#[test]
 fn failed_whisper_cleans_up() {
     let _serial = serial();
     let dir = TempDir::new();
@@ -277,6 +300,28 @@ fn send_command_queues_a_copy() {
 }
 
 #[test]
+fn send_command_posts_a_file_named_help() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    fs::write(dir.path().join("help"), "notes").expect("write");
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-matrix"))
+        .args(["send", "help"])
+        .current_dir(dir.path())
+        .env_clear()
+        .env("XDG_CACHE_HOME", dir.path())
+        .env("HERDR_PANE_ID", "w1:p2")
+        .output()
+        .expect("ran");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    let uploads = dir.path().join("herdr-matrix/uploads");
+    assert_eq!(
+        fs::read_dir(&uploads).expect("an upload directory").count(),
+        2
+    );
+}
+
+#[test]
 fn send_command_in_a_sandbox_queues_in_the_agents_queue() {
     let _serial = serial();
     let dir = TempDir::new();
@@ -307,6 +352,8 @@ fn send_command_in_a_sandbox_queues_in_the_agents_queue() {
     assert!(!dir.path().join("herdr-matrix").exists());
 }
 
+const NO_PANE: &str = "send works only in a herdr pane: HERDR_PANE_ID is not set";
+
 #[test]
 fn send_command_refuses() {
     let _serial = serial();
@@ -319,8 +366,8 @@ fn send_command_refuses() {
     let _ = Command::new("mkfifo").arg(&fifo).status();
     let shown = |p: &Path| p.display().to_string();
     let mut refusals = vec![
-        (None, shown(&shot), "not in a herdr pane".to_owned()),
-        (Some(""), shown(&shot), "not in a herdr pane".to_owned()),
+        (None, shown(&shot), NO_PANE.to_owned()),
+        (Some(""), shown(&shot), NO_PANE.to_owned()),
         (
             Some("w1:p2"),
             shown(dir.path()),
@@ -342,7 +389,7 @@ fn send_command_refuses() {
     for (pane, path, want) in refusals {
         assert_eq!(
             send(dir.path(), pane, &[&path]),
-            (Some(1), format!("{want}\n")),
+            (Some(1), format!("herdr-matrix: {want}\n")),
             "{path}"
         );
     }
@@ -350,7 +397,7 @@ fn send_command_refuses() {
     let (code, err) = send(dir.path(), Some("w1:p2"), &[&shown(&missing)]);
     assert_eq!(code, Some(1));
     assert!(
-        err.starts_with(&format!("{}: ", missing.display())),
+        err.starts_with(&format!("herdr-matrix: {}: ", missing.display())),
         "{err}"
     );
     assert_eq!(err.lines().count(), 1);
@@ -372,6 +419,21 @@ fn herdr_timeout_is_an_error() {
     let (code, out) = herdr.run(&["agent", "list"]).expect("ran");
     assert_ne!(code, 0);
     assert!(out.contains("timed out"), "{out}");
+}
+
+#[test]
+fn herdr_error_carries_its_stderr() {
+    let _serial = serial();
+    let dir = TempDir::new();
+    let program = script(dir.path(), "herdr", "echo 'no server' >&2\nexit 1");
+    let mut herdr = RunHerdr {
+        program,
+        timeout: Duration::from_secs(5),
+    };
+    assert_eq!(
+        herdr.run(&["agent", "list"]).expect("ran"),
+        (1, "no server\n".to_owned())
+    );
 }
 
 /// The binary with `env` alone and `input` on stdin; its exit code, stdout
@@ -432,14 +494,18 @@ fn chats_prints_the_answer_of_the_gate() {
     );
     assert_eq!(
         run(&["chats", "send", "!h:x", "hi", "--since"], &env, ""),
-        (Some(1), String::new(), "not a bridged chat\n".to_owned())
+        (
+            Some(1),
+            String::new(),
+            "herdr-matrix: not a bridged chat\n".to_owned()
+        )
     );
     assert_eq!(
         run(&["chats"], &env, ""),
         (
             Some(1),
             String::new(),
-            "the gate gave no answer\n".to_owned()
+            "herdr-matrix: the gate gave no answer\n".to_owned()
         )
     );
     assert_eq!(
@@ -452,7 +518,10 @@ fn chats_prints_the_answer_of_the_gate() {
     );
     let (code, out, err) = run(&["chats", "rooms"], &env, "");
     assert_eq!((code, out.as_str()), (Some(1), ""));
-    assert!(err.starts_with("cannot reach the gate: "), "{err}");
+    assert!(
+        err.starts_with("herdr-matrix: cannot reach the gate: "),
+        "{err}"
+    );
     assert_eq!(err.lines().count(), 1);
 }
 
@@ -481,4 +550,50 @@ fn gate_answers_a_bad_request() {
             "{input}"
         );
     }
+}
+
+#[test]
+fn help_is_printed_on_stdout() {
+    let _serial = serial();
+    for args in [
+        &["-h"][..],
+        &["--help"],
+        &["help"],
+        &["send", "-h"],
+        &["prompt", "--help"],
+    ] {
+        let (code, out, err) = run(args, &[], "");
+        assert_eq!((code, err.as_str()), (Some(0), ""), "{args:?}");
+        assert!(out.starts_with("usage: herdr-matrix"), "{args:?}: {out}");
+        assert!(
+            out.contains("post a file to the owner's chat, from a herdr pane"),
+            "{out}"
+        );
+    }
+    for args in [
+        &["chats", "-h"][..],
+        &["chats", "help"],
+        &["chats", "--help"],
+    ] {
+        let (code, out, err) = run(args, &[], "");
+        assert_eq!((code, err.as_str()), (Some(0), ""), "{args:?}");
+        assert!(out.starts_with("usage: herdr-matrix chats rooms"), "{out}");
+    }
+}
+
+#[test]
+fn bare_start_without_settings_prints_the_usage() {
+    let _serial = serial();
+    let (code, out, err) = run(&[], &[], "");
+    assert_eq!((code, out.as_str()), (Some(2), ""));
+    assert!(err.starts_with("usage: herdr-matrix"), "{err}");
+    let dir = TempDir::new();
+    let (code, _, err) = run(&[], &[("HERDR_MATRIX_TOKEN", dir.path())], "");
+    assert_eq!(
+        (code, err.as_str()),
+        (
+            Some(1),
+            "herdr-matrix: HERDR_MATRIX_HOMESERVER is not set\n"
+        )
+    );
 }

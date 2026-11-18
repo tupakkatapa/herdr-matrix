@@ -15,6 +15,10 @@ use crate::files::{FILE_TTL, open_inside, private_dir, purge, random_name};
 
 /// Bytes of an entry at most; the rest of a longer one is not read
 const ENTRY_MAX: u64 = 1 << 20;
+/// Files taken from a queue at once; the rest wait for the next take
+const UPLOADS_TAKEN: usize = 5;
+/// Bytes of a file's name at most; the rest of a longer one is cut
+const NAME_MAX: usize = 255;
 
 /// A prompt for the agent `agent` names, or with `cwd`, for the agent
 /// working there; `at` is in seconds since the epoch.
@@ -101,36 +105,71 @@ fn create(path: &Path) -> Result<fs::File> {
 /// # Errors
 /// When `dir` is not private or cannot be read.
 pub fn take(dir: &Path, log: &dyn Fn(&str)) -> Result<Vec<Prompt>> {
-    Ok(take_all(dir, "prompt", log)?
+    Ok(take_all(dir, "prompt", usize::MAX, log)?
         .into_iter()
         .map(|(prompt, _)| prompt)
         .collect())
 }
 
-/// The files queued in `dir`, oldest first, each with the path of its
-/// copy. Each entry is removed before it is returned, so a crash cannot
-/// post twice; copies older than `FILE_TTL` are removed. `now` is in
-/// seconds since the epoch.
+/// The oldest `UPLOADS_TAKEN` files queued in `dir`, oldest first, each
+/// with the path of its copy, its name cut to `NAME_MAX` bytes and its time
+/// no later than `now`. Each
+/// entry is removed before it is returned, so a crash cannot post twice;
+/// copies older than `FILE_TTL` are removed. `now` is in seconds since the
+/// epoch.
 ///
 /// # Errors
 /// When `dir` is not private or cannot be read.
 pub fn take_uploads(dir: &Path, now: f64, log: &dyn Fn(&str)) -> Result<Vec<(Upload, PathBuf)>> {
-    let uploads = take_all(dir, "upload", log)?;
+    let uploads = take_all(dir, "upload", UPLOADS_TAKEN, log)?;
     if fs::symlink_metadata(dir).is_ok() {
         purge(dir, now - FILE_TTL.as_secs_f64())?;
     }
     Ok(uploads
         .into_iter()
-        .map(|(upload, path)| (upload, path.with_extension("data")))
+        .map(|(mut upload, path): (Upload, PathBuf)| {
+            let cut = upload.name.floor_char_boundary(NAME_MAX);
+            upload.name.truncate(cut);
+            upload.at = upload.at.min(now);
+            (upload, path.with_extension("data"))
+        })
         .collect())
 }
 
-/// The entries queued in `dir`, oldest first, with their paths, each
-/// removed before it is returned; one that cannot be read is logged as a
-/// `what`.
+/// True when taking from `dir` is worth it: an entry is there, or `dir`
+/// is there and not private, which taking reports.
+#[must_use]
+pub fn queued(dir: &Path) -> bool {
+    if fs::symlink_metadata(dir).is_err_and(|err| err.kind() == ErrorKind::NotFound) {
+        return false;
+    }
+    private_dir(dir).is_err()
+        || fs::read_dir(dir).map_or(true, |entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .any(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        })
+}
+
+/// Queues again a file taken from the queue, beside its copy `data`.
+///
+/// # Errors
+/// When the entry cannot be written.
+pub fn requeue(upload: &Upload, data: &Path) -> Result<()> {
+    place(
+        data.parent().unwrap_or(data),
+        &data.with_extension("json"),
+        upload,
+    )
+}
+
+/// The oldest `max` entries queued in `dir`, oldest first, with their
+/// paths, each removed before it is returned; one that cannot be read is
+/// removed and logged as a `what`.
 fn take_all<T: DeserializeOwned>(
     dir: &Path,
     what: &str,
+    max: usize,
     log: &dyn Fn(&str),
 ) -> Result<Vec<(T, PathBuf)>> {
     match fs::symlink_metadata(dir) {
@@ -146,6 +185,9 @@ fn take_all<T: DeserializeOwned>(
     names.sort();
     let mut entries = Vec::new();
     for name in names {
+        if entries.len() == max {
+            break;
+        }
         let path = dir.join(&name);
         let taken = open_inside(dir, &path)
             .and_then(|file| {
@@ -155,7 +197,10 @@ fn take_all<T: DeserializeOwned>(
             .and_then(|data| fs::remove_file(&path).map(|()| data));
         let parsed = match taken {
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => Err(err.to_string()),
+            Err(err) => {
+                let _ = fs::remove_file(&path);
+                Err(err.to_string())
+            }
             Ok(data) => serde_json::from_slice(&data).map_err(|err| err.to_string()),
         };
         match parsed {
@@ -225,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_file_stays_and_the_others_are_taken() {
+    fn unreadable_file_is_removed_and_logged_once() {
         let dir = TempDir::new();
         let inbox = dir.path().join("prompts");
         queue(&inbox, &prompt("a", 1000.0)).expect("queue");
@@ -236,12 +281,14 @@ mod tests {
             return;
         }
         let lines = RefCell::new(Vec::new());
-        let taken = take(&inbox, &|line| lines.borrow_mut().push(line.to_owned())).expect("take");
+        let log = |line: &str| lines.borrow_mut().push(line.to_owned());
+        let taken = take(&inbox, &log).expect("take");
         assert_eq!(taken, [prompt("a", 1000.0)]);
+        assert!(take(&inbox, &log).expect("take").is_empty());
         let lines = lines.into_inner();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].starts_with("error: prompt 0000000000001-x.json: "));
-        assert!(locked.exists());
+        assert!(!locked.exists());
     }
 
     fn upload(at: f64) -> Upload {

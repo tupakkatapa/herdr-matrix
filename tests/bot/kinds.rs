@@ -107,10 +107,7 @@ fn pi_noop_posts_nothing_and_last_shows_it() {
     append(&session, &pi_turn(&["Looking.", "Found one."]));
     t.set("wB:p1", "idle");
     t.tell("!attach repo-wA");
-    assert_eq!(
-        t.last_msg(),
-        "**repo-wA** attached; it is idle.\n\nFound one."
-    );
+    assert_eq!(t.last_msg(), "repo-wA attached; it is idle.\n\nFound one.");
 }
 
 #[test]
@@ -126,7 +123,10 @@ fn new_starts_the_kind_of_the_folder() {
     }];
     t.tell("!new beta");
     assert_eq!(t.herdr.last(), c(&["pane", "run", "wN:p1", "pi"]));
-    assert!(t.last_msg().contains(&format!("Started pi in {beta}")));
+    assert!(
+        t.last_msg()
+            .contains(&format!("Started pi as beta in {beta};"))
+    );
 }
 
 /// `wA:p1` is the confined pi agent `nora` in `/w/a`; its state directory.
@@ -256,4 +256,24 @@ fn kind_without_a_reader_shows_its_screen() {
     t.set("wA:p1", "idle");
     t.poll();
     assert_eq!(t.new_msgs(), ["screen of wA:p1"]);
+}
+
+#[test]
+fn two_pi_agents_in_one_folder_show_their_screens() {
+    let mut t = T::new();
+    pi(&mut t);
+    let mut herdr = t.herdr.0.borrow_mut();
+    herdr.kinds.insert("wA:p2".into(), "pi".into());
+    herdr.cwd.insert("wA:p2".into(), "/w/a/".into());
+    drop(herdr);
+    t.set("wA:p1", "idle");
+    t.set("wA:p2", "idle");
+    t.poll();
+    t.tell("!attach wA:p1");
+    t.tell("Hello");
+    t.set("wA:p1", "working");
+    t.poll();
+    t.set("wA:p1", "idle");
+    t.poll();
+    assert_eq!(t.last_msg(), "screen of wA:p1");
 }

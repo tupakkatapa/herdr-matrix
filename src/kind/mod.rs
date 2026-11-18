@@ -64,7 +64,7 @@ impl TryFrom<String> for Kind {
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str(match self {
-            Self::Claude => "Claude",
+            Self::Claude => "Claude Code",
             other => other.program(),
         })
     }
@@ -92,8 +92,12 @@ pub fn confined_turn(kind: &Kind, state: &Path) -> Option<Turn> {
         Kind::Pi => ("sessions", pi::parse),
         Kind::Other(_) => return None,
     };
+    let sessions = state.join(sessions);
+    if !fs::symlink_metadata(&sessions).ok()?.is_dir() {
+        return None;
+    }
     let newest = newest(
-        entries(&state.join(sessions))
+        entries(&sessions)
             .filter(|dir| dir.file_type().is_ok_and(|t| t.is_dir()))
             .flat_map(|dir| entries(&dir.path()).collect::<Vec<_>>()),
     )?;
@@ -138,6 +142,22 @@ fn tail(mut file: fs::File, bytes: u64) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempDir;
+
+    #[test]
+    fn symlinked_projects_give_no_turn() {
+        let dir = TempDir::new();
+        let state = dir.path().join("state");
+        let outside = dir.path().join("outside/-w-a");
+        fs::create_dir_all(&state).expect("mkdir");
+        fs::create_dir_all(&outside).expect("mkdir");
+        let line = serde_json::json!({"type": "assistant", "uuid": "u1",
+            "message": {"content": [{"type": "text", "text": "secret"}]}});
+        fs::write(outside.join("s.jsonl"), format!("{line}\n")).expect("write");
+        std::os::unix::fs::symlink(dir.path().join("outside"), state.join("projects"))
+            .expect("symlink");
+        assert_eq!(confined_turn(&Kind::Claude, &state), None);
+    }
 
     #[test]
     fn kind_of_the_settings_has_a_reader() {
@@ -148,7 +168,7 @@ mod tests {
         assert_eq!(Kind::parse("codex"), Kind::Other("codex".into()));
         assert_eq!(
             [Kind::Claude, Kind::Pi, Kind::parse("codex")].map(|k| k.to_string()),
-            ["Claude", "pi", "codex"]
+            ["Claude Code", "pi", "codex"]
         );
     }
 }

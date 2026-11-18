@@ -255,6 +255,7 @@ fn failed_post_keeps_the_message() {
     t.poll();
     t.set("wA:p1", "idle");
     t.poll();
+    t.poll();
     assert_eq!(t.new_msgs(), ["one", "two"]);
 }
 
@@ -392,7 +393,8 @@ fn new_agent_ends_its_turn_when_ready() {
     t.said("wN:p1", &[("u1", "at the desk")], None);
     t.set("wN:p1", "idle");
     t.poll();
-    assert_eq!(t.new_msgs().len(), 1);
+    assert_eq!(t.new_msgs().len(), 2);
+    assert_eq!(t.new_msgs()[1], "repo-wN is ready.");
     assert!(t.matrix.typing().is_empty());
 }
 
@@ -518,7 +520,7 @@ fn failed_key_of_a_reaction_is_said() {
     t.react(&id, "\u{1F44D}");
     assert_eq!(
         t.last_msg(),
-        "Could not answer **repo-wA**: send-keys failed"
+        "Could not answer repo-wA: send-keys failed. Is herdr running?"
     );
     assert!(t.bot.state().pending.is_empty());
     assert!(t.bot.state().asked.contains_key("wA:p1"));
@@ -545,7 +547,10 @@ fn unattached_command_lists_the_agents() {
     t.set("wA:p1", "working");
     t.set("wB:p1", "working");
     t.tell("!stop");
-    assert!(t.last_msg().starts_with("Not attached. !attach one of:"));
+    assert!(
+        t.last_msg()
+            .starts_with("No agent is attached. !attach one first:")
+    );
     assert!(t.herdr.did("send-keys").is_empty());
 }
 
@@ -554,8 +559,12 @@ fn failed_exit_is_said() {
     let mut t = T::new();
     t.prompted("Hello");
     broken(&t, "pane", "close");
+    t.tell("!exit");
     t.tell("!exit now");
-    assert_eq!(t.last_msg(), "Could not close **repo-wA**: close failed");
+    assert_eq!(
+        t.last_msg(),
+        "Could not close repo-wA: close failed. Is herdr running?"
+    );
     assert!(t.bot.state().pending.contains_key("wA:p1"));
 }
 
@@ -578,4 +587,159 @@ fn failed_new_agent_is_said() {
         ["Failed to deliver the message: herdr: create failed. Is herdr running?"]
     );
     assert_eq!(t.bot.state().attached, None);
+}
+
+#[test]
+fn screen_shows_at_least_one_line() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.tell("!screen 0");
+    assert_eq!(t.herdr.did("read").last().expect("a read")[6], "1");
+}
+
+#[test]
+fn equal_parts_get_their_own_transactions() {
+    let mut t = T::new();
+    let part = "a".repeat(9000);
+    t.say(&format!("{part}\n\n{part}"), To::default());
+    let puts: Vec<String> = t
+        .matrix
+        .calls()
+        .into_iter()
+        .filter(|c| c.0 == "PUT" && c.1.contains("/send/"))
+        .map(|c| c.1)
+        .collect();
+    let n = puts.len();
+    assert_ne!(puts[n - 2], puts[n - 1]);
+}
+
+#[test]
+fn clock_step_back_does_not_stall_the_poll() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.bot.tick().expect("tick");
+    t.advance(-600.0);
+    let lists = t.herdr.did("list").len();
+    t.advance(3.0);
+    t.bot.tick().expect("tick");
+    assert_eq!(t.herdr.did("list").len(), lists + 1);
+}
+
+#[test]
+fn clock_step_back_does_not_hold_the_answer() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.set("wA:p1", "working");
+    t.said("wA:p1", &[("u1", "old answer"), ("u2", "Looking.")], None);
+    t.poll();
+    t.advance(-600.0);
+    t.poll();
+    assert_eq!(t.new_msgs(), ["Looking."]);
+}
+
+#[test]
+fn herdr_failure_backs_off_the_poll_alone() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.herdr.0.borrow_mut().fail = 1000;
+    t.clear_log();
+    for _ in 0..40 {
+        t.advance(0.5);
+        t.bot.tick().expect("tick");
+    }
+    assert_eq!(
+        t.log_lines(),
+        ["error: poll: herdr: agent list: herdr is down"],
+        "{:?}",
+        t.log_lines()
+    );
+    let lists = t.herdr.did("list").len();
+    assert!(lists < 6, "{lists} lists in 20 s");
+    t.tell("!agents");
+    assert!(t.last_msg().contains("Failed"));
+    t.herdr.0.borrow_mut().fail = 0;
+    t.advance(60.0);
+    t.bot.tick().expect("tick");
+    assert_eq!(
+        t.log_lines().last().map(String::as_str),
+        Some("poll: ok again")
+    );
+}
+
+#[test]
+fn herdr_failure_backs_off_the_poll_during_a_turn() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.herdr.0.borrow_mut().fail = 1000;
+    t.herdr.0.borrow_mut().calls.clear();
+    for _ in 0..40 {
+        t.advance(0.5);
+        t.bot.tick().expect("tick");
+    }
+    let lists = t.herdr.did("list").len();
+    assert!(lists < 6, "{lists} lists in 20 s");
+}
+
+#[test]
+fn failed_save_after_a_delivered_prompt_is_logged_alone() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    let mut tmp = t.state_path().into_os_string();
+    tmp.push(".tmp");
+    let blocked = tmp.clone();
+    t.herdr.0.borrow_mut().hook = Some(Box::new(move |args| {
+        if args[1] == "prompt" {
+            std::fs::create_dir(&blocked).expect("mkdir");
+        }
+    }));
+    t.tell("hi");
+    std::fs::remove_dir(&tmp).expect("rmdir");
+    assert_eq!(t.herdr.did("prompt").len(), 1);
+    assert!(t.new_msgs().is_empty(), "{:?}", t.new_msgs());
+    assert!(
+        t.log_lines().iter().any(|l| l.starts_with("error: ")),
+        "{:?}",
+        t.log_lines()
+    );
+}
+
+#[test]
+fn start_is_logged() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.spawn("wA:p1", "repo-wA");
+    t.tell("!attach repo-wA");
+    t.tell("!afk");
+    t.clear_log();
+    t.bot = t.make();
+    t.bot.log_start();
+    assert_eq!(
+        t.log_lines(),
+        ["started: contacts 1, attached wA:p1, away on"]
+    );
+}
+
+#[test]
+fn failed_nick_does_not_fail_exit_or_new() {
+    let mut t = T::new();
+    t.bot.deps_mut().name = Some("Claude".into());
+    std::fs::create_dir_all(t.dir.path().join("ws/beta")).expect("mkdir");
+    t.set("wA:p1", "idle");
+    t.tell("!attach repo-wA");
+    t.matrix
+        .0
+        .borrow_mut()
+        .refuse
+        .push("/state/m.room.member/".into());
+    t.tell("!exit");
+    t.tell("!exit now");
+    assert_eq!(t.last_msg(), "Closed repo-wA.");
+    assert_eq!(t.bot.state().attached, None);
+    t.tell("!new beta");
+    assert!(
+        t.last_msg().starts_with("Started Claude Code as beta in "),
+        "{}",
+        t.last_msg()
+    );
+    assert_eq!(t.bot.state().attached.as_deref(), Some("wN:p1"));
 }

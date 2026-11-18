@@ -17,7 +17,7 @@ fn permission_prompt_is_listed() {
     t.working_then("blocked", "wA:p1");
     let note = t.last_msg();
     assert!(note.starts_with(
-        "**Do you want to proceed?**\n1. Yes\n\
+        "Do you want to proceed?\n1. Yes\n\
          2. Yes, and don't ask again for rm commands\n\
          3. No, and tell Claude what to do differently (esc)"
     ));
@@ -246,7 +246,7 @@ fn question_is_listed_and_takes_a_number_or_text() {
     t.poll();
     assert_eq!(
         t.last_msg(),
-        "**Pick a fruit?**\n1. Apple - red\n2. Pear - green\n\nAnswer with a number, or write your own answer."
+        "Pick a fruit?\n1. Apple - red\n2. Pear - green\n\nAnswer with a number, or write your own answer."
     );
     t.tell("2");
     assert_eq!(t.herdr.last(), c(&["agent", "send-keys", "wA:p1", "2"]));
@@ -271,7 +271,10 @@ fn several_questions_point_to_the_screen() {
     t.said("wA:p1", &[], Some(two));
     t.set("wA:p1", "blocked");
     t.poll();
-    assert!(t.last_msg().contains("use !screen and keys"));
+    assert!(t.last_msg().contains(
+        "Several answers are needed. Send one key at a time: up or down to move, \
+         space to tick, enter to confirm. !screen shows where you are."
+    ));
     t.tell("Banana");
     assert!(t.last_msg().contains("one key"));
 }
@@ -329,4 +332,44 @@ fn reaction_without_a_target_is_ignored() {
     t.queue(batch);
     t.sync();
     assert!(t.herdr.did("send-keys").is_empty());
+}
+
+#[test]
+fn typed_answer_to_a_choice_on_screen_is_read_as_a_key() {
+    let mut t = T::new();
+    t.herdr
+        .0
+        .borrow_mut()
+        .screens
+        .insert("wA:p1".into(), PERMISSION.into());
+    t.prompted("Hello");
+    t.set("wA:p1", "blocked");
+    t.poll();
+    for (typed, key) in [("2.", "2"), ("Yes!", "y"), ("y ", "y"), ("Cancel.", "esc")] {
+        t.tell(typed);
+        assert_eq!(
+            t.herdr.last(),
+            c(&["agent", "send-keys", "wA:p1", key]),
+            "{typed}"
+        );
+    }
+}
+
+#[test]
+fn typed_answer_to_a_question_stays_as_written() {
+    let mut t = T::new();
+    t.prompted("Hello");
+    t.said("wA:p1", &[("u1", "old answer")], Some(fruit()));
+    t.set("wA:p1", "blocked");
+    t.poll();
+    t.tell("2.");
+    assert_eq!(
+        t.herdr.did("send-keys")[0],
+        c(&["agent", "send-keys", "wA:p1", "3"])
+    );
+    assert!(
+        t.herdr
+            .calls()
+            .contains(&c(&["pane", "send-text", "wA:p1", "2."]))
+    );
 }

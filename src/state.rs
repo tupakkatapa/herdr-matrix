@@ -1,6 +1,7 @@
 //! What the bot keeps across restarts, in `matrix-state.json`. A file of
 //! an older version loads; keys this version does not know are kept.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -52,6 +53,10 @@ pub struct State {
     pub spawned: IndexMap<String, Chat>,
     /// The sha256 of a picture → its mxc URI
     pub avatars: IndexMap<String, String>,
+    /// The `cwd` of each configured agent whose own chat the owner closed:
+    /// the bot opens it again only on `!dm`
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub left: BTreeSet<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -110,6 +115,9 @@ pub struct Chat {
     /// The sha256 of the contact's picture last set
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar: Option<String>,
+    /// The `cwd` of the settings of its agent: the chat lasts while they do
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }

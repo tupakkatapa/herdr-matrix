@@ -9,8 +9,12 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use super::{Bot, FILES_WAIT, MARK, STALE, To, same_dir};
-use crate::commands::{KEY_HINT, KEYS, reaction, spoken};
+use super::contacts::Why;
+use super::{
+    Bot, FILES_WAIT, FOLLOW_UP, MARK, RETRY_MAX, STALE, SYNC_TURN, Sandbox, To, due, herdr_failed,
+    not_running, same_dir,
+};
+use crate::commands::{KEY_HINT, KEYS, reaction, spoken, typed_key};
 use crate::files;
 use crate::herdr::{self, Agent, Herdr, Status};
 use crate::inbox::{self, Prompt, Upload};
@@ -41,6 +45,11 @@ impl fmt::Display for Delivery {
     }
 }
 
+/// Tries of a queued file the homeserver fails to take
+const UPLOAD_TRIES: u32 = 3;
+/// The wait before a file the homeserver failed to take is tried again
+const UPLOAD_RETRY: Duration = Duration::from_mins(1);
+
 /// Who files from the chat are for: the agent in a pane, from the main chat
 /// or from its own chat.
 #[derive(Clone, PartialEq, Eq)]
@@ -69,6 +78,15 @@ pub(super) struct Held {
     at: f64,
 }
 
+/// The messages of the main chat that found no agent, kept together: their
+/// files, their text, the last event, and when the last came.
+pub(super) struct Kept {
+    files: Vec<Media>,
+    text: Option<(String, Delivery)>,
+    id: Option<String>,
+    pub(super) at: f64,
+}
+
 /// A message of the owner on its way to an agent, and what kind it is.
 #[derive(Clone, Copy)]
 struct Message<'a> {
@@ -81,15 +99,20 @@ struct Message<'a> {
 impl Bot {
     /// New messages in the chat, then in each agent's own chat; an agent's
     /// contact sees only its own room. The first sync of a chat skips
-    /// history.
+    /// history. While a turn is under way, the wait is short.
     ///
     /// # Errors
     /// When Matrix or herdr fails.
     pub fn sync(&mut self) -> Result<()> {
         let first = self.state.since.is_none();
+        let wait = if self.state.pending.is_empty() {
+            SYNC_WAIT
+        } else {
+            SYNC_TURN
+        };
         let resp = self
             .matrix
-            .sync(self.state.since.as_deref(), As::Bot, SYNC_WAIT)?;
+            .sync(self.state.since.as_deref(), As::Bot, wait)?;
         let moved = !first && self.guard(&resp)?;
         let todo = match &self.state.control {
             Some(room) if !first && !moved => resp.inbound(room, &self.deps.owner),
@@ -113,17 +136,22 @@ impl Bot {
                 continue;
             };
             let fresh = chat.since.is_none();
-            let resp =
-                match self
-                    .matrix
-                    .sync(chat.since.as_deref(), As::User(&chat.user), Duration::ZERO)
-                {
-                    Ok(resp) => resp,
-                    Err(err) => {
-                        self.log(&format!("error: sync {}: {}", chat.user, err));
-                        continue;
-                    }
-                };
+            let mut synced = None;
+            self.retry(&format!("sync {}", chat.user), RETRY_MAX, |bot| {
+                let since = chat.since.as_deref();
+                synced = Some(
+                    bot.matrix
+                        .sync(since, As::User(&chat.user), Duration::ZERO)?,
+                );
+                Ok(())
+            });
+            let Some(resp) = synced else {
+                continue;
+            };
+            if resp.strangers(&chat.room, &[&self.deps.owner, &chat.user]) {
+                self.end_chat(&pane, Why::Stranger)?;
+                continue;
+            }
             let todo = if fresh {
                 Vec::new()
             } else {
@@ -203,8 +231,8 @@ impl Bot {
     }
 
     /// Saves a file from the chat in `dir` and holds it for `to`, beside
-    /// the files that came for it before.
-    fn hold(&mut self, to: Holder, media: &Media, ev: &Inbound, dir: &Path) -> Result<()> {
+    /// the files that came for it before; `id` is its event.
+    fn hold(&mut self, to: Holder, media: &Media, id: Option<&str>, dir: &Path) -> Result<()> {
         let path = self.keep(media, dir)?;
         let at = self.now();
         let i = if let Some(i) = self.held_files.iter().position(|h| h.to == to) {
@@ -224,7 +252,7 @@ impl Bot {
         if media.body != media.name {
             held.captions.push(media.body.clone());
         }
-        held.id = ev.id.clone().or(held.id.take());
+        held.id = id.map(str::to_owned).or(held.id.take());
         held.at = at;
         Ok(())
     }
@@ -232,8 +260,8 @@ impl Bot {
     /// Hands over the files from the chat for which no more came in
     /// `FILES_WAIT`.
     pub fn hand_over_files(&mut self) {
-        let old = self.now() - FILES_WAIT.as_secs_f64();
-        self.hand_over(|held| held.at <= old);
+        let now = self.now();
+        self.hand_over(|held| due(now, held.at, FILES_WAIT));
     }
 
     /// Hands over the held files `due` picks, each agent's as one prompt.
@@ -257,16 +285,19 @@ impl Bot {
         }
     }
 
-    fn hand(&mut self, held: &Held, chat: Option<&Chat>) -> Result<()> {
+    /// Hands held files to their agent; true when they reached it.
+    fn hand(&mut self, held: &Held, chat: Option<&Chat>) -> Result<bool> {
         let text = files_prompt(&held.captions, &held.paths);
         let (Holder::Main(pane) | Holder::Own(pane)) = &held.to;
+        let name = self
+            .listed
+            .iter()
+            .find(|a| &a.pane_id == pane)
+            .map(|a| a.name.clone());
         let agents = self.agents()?;
         let Some(a) = agents.iter().find(|a| &a.pane_id == pane) else {
-            self.say(
-                "The agent is not running right now; nothing was sent.",
-                To::chat(chat),
-            )?;
-            return Ok(());
+            self.say(&not_running(name.as_deref()), To::chat(chat))?;
+            return Ok(false);
         };
         self.deliver(
             a,
@@ -314,11 +345,10 @@ impl Bot {
             .iter()
             .find(|a| a.pane_id == pane && a.status == Status::Blocked)
         else {
-            let name = agents
-                .iter()
-                .find(|a| a.pane_id == pane)
-                .map_or(pane.as_str(), |a| a.name.as_str());
-            let said = format!("**{name}** no longer waits on that choice.");
+            let said = agents.iter().find(|a| a.pane_id == pane).map_or_else(
+                || "That agent no longer waits on that choice.".to_owned(),
+                |a| format!("**{}** no longer waits on that choice.", a.name),
+            );
             self.say(&said, to)?;
             return Ok(());
         };
@@ -328,14 +358,22 @@ impl Bot {
         }
         match herdr::send_keys(self.deps.herdr.as_mut(), &pane, key) {
             Err(Error::Herdr(out)) => {
-                self.say(&format!("Could not answer **{}**: {out}", a.name), to)?;
+                self.say(&herdr_failed("answer", &a.name, &out), to)?;
                 return Ok(());
             }
             other => other?,
         }
         self.log(&format!("{pane} reaction {key}"));
         self.state.asked.shift_remove(&pane);
-        self.expect(&pane, &turn, Origin::default())
+        self.expect(
+            &pane,
+            &turn,
+            Origin {
+                spawned: contact.is_some(),
+                ..Origin::default()
+            },
+        );
+        Ok(())
     }
 
     /// Saves a file from the chat in `dir`, a private directory; its path.
@@ -351,8 +389,15 @@ impl Bot {
         })
     }
 
-    /// What the owner says in a voice message, as typed; None when nothing.
-    fn listen(&mut self, media: &Media, chat: Option<&Chat>) -> Result<Option<String>> {
+    /// What the owner says in a voice message `id`, as typed; None when
+    /// nothing. The message shows read, and the chat typing, while it is
+    /// heard.
+    fn listen(
+        &mut self,
+        media: &Media,
+        id: Option<&str>,
+        chat: Option<&Chat>,
+    ) -> Result<Option<String>> {
         if self.deps.transcribe.is_none() {
             self.say(
                 "Voice messages are not set up: set transcribe.model.",
@@ -360,29 +405,67 @@ impl Bot {
             )?;
             return Ok(None);
         }
+        self.mark_read(id, chat)?;
+        self.show_typing(chat, true);
+        let typed = self.hear(media).and_then(|heard| {
+            if heard.is_empty() {
+                self.say("Could not understand the voice message.", To::chat(chat))?;
+                return Ok(None);
+            }
+            let typed = spoken(&heard);
+            let echo = if typed == heard {
+                format!("\u{1F3A4} {heard}")
+            } else {
+                format!("\u{1F3A4} {heard} \u{2192} {typed}")
+            };
+            self.say(&echo, To::chat(chat).quiet())?;
+            Ok(Some(typed))
+        });
+        self.show_typing(chat, false);
+        typed
+    }
+
+    /// What a voice message says.
+    fn hear(&mut self, media: &Media) -> Result<String> {
         let dir = self.deps.files.clone();
         let path = self.keep(media, &dir)?;
-        let heard = self.deps.transcribe.as_ref().map(|hear| hear(&path));
+        let heard = self
+            .deps
+            .transcribe
+            .as_ref()
+            .map_or_else(|| Ok(String::new()), |hear| hear(&path));
         if let Err(err) = fs::remove_file(&path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
             self.log(&format!("error: {}: {err}", path.display()));
         }
-        let Some(heard) = heard.transpose()? else {
-            return Ok(None);
-        };
-        if heard.is_empty() {
-            self.say("Could not understand the voice message.", To::chat(chat))?;
-            return Ok(None);
+        heard
+    }
+
+    /// Shows the bot, or an agent's contact, typing in its chat, or stops
+    /// it; a typing notice of a turn under way stays. A failure is logged.
+    fn show_typing(&mut self, chat: Option<&Chat>, on: bool) {
+        let key = chat.and_then(|c| {
+            self.state
+                .spawned
+                .iter()
+                .find(|(_, x)| x.room == c.room)
+                .map(|(pane, _)| pane.clone())
+        });
+        if !on && self.typing.contains_key(&key) {
+            return;
         }
-        let typed = spoken(&heard);
-        let echo = if typed == heard {
-            format!("\u{1F3A4} {heard}")
-        } else {
-            format!("\u{1F3A4} {heard} \u{2192} {typed}")
-        };
-        self.say(&echo, To::chat(chat).quiet())?;
-        Ok(Some(typed))
+        let shown = match chat {
+            Some(c) => Ok(c.user.clone()),
+            None => self.me(),
+        }
+        .and_then(|user| {
+            let (room, by) = self.room(chat)?;
+            self.matrix.typing(&room, by, &user, on)
+        });
+        if let Err(err) = shown {
+            self.log(&format!("error: typing: {err}"));
+        }
     }
 
     /// A message from the owner in the chat, or in the own chat of the
@@ -393,7 +476,7 @@ impl Bot {
             None => None,
         };
         let (text, media) = match &ev.what {
-            What::Voice(media) => match self.listen(media, chat.as_ref())? {
+            What::Voice(media) => match self.listen(media, ev.id.as_deref(), chat.as_ref())? {
                 Some(text) => (text, None),
                 None => return Ok(()),
             },
@@ -403,43 +486,45 @@ impl Bot {
         };
         let agents = self.agents()?;
         let mine = contact.and_then(|c| agents.iter().find(|a| a.pane_id == c));
-        if contact.is_some() && mine.is_none() {
-            self.say(
-                "The agent is not running right now; nothing was sent.",
-                To::chat(chat.as_ref()),
-            )?;
+        // A space after `!`, trailing punctuation and capitals are slips
+        if let Some(command) = text.strip_prefix('!') {
+            let command = command.trim_start();
+            let (word, rest) = command
+                .split_once(char::is_whitespace)
+                .unwrap_or((command, ""));
+            let word = word
+                .trim_end_matches(|c: char| c.is_ascii_punctuation())
+                .to_lowercase();
+            return self.command(&format!("!{word}"), rest.trim(), &agents, ev, contact, mine);
+        }
+        if let Some(contact) = contact.filter(|_| mine.is_none()) {
+            let name = self.chat_agent_name(contact);
+            self.say(&not_running(name.as_deref()), To::chat(chat.as_ref()))?;
             return Ok(());
-        }
-        let (word, rest) = text.split_once(' ').unwrap_or((&text, ""));
-        if word.starts_with('!') {
-            return self.command(
-                &word.to_lowercase(),
-                rest.trim(),
-                &agents,
-                ev,
-                contact,
-                mine,
-            );
-        }
-        let Some(a) = mine.or_else(|| self.target(ev, &agents)) else {
-            return self.ask_which("Not attached. !attach one of:", &agents);
-        };
-        if let Some(media) = media {
-            let to = match contact {
-                Some(_) => Holder::Own(a.pane_id.clone()),
-                None => Holder::Main(a.pane_id.clone()),
-            };
-            // A confined agent reads only its own files
-            let dir = self
-                .sandbox(a)
-                .map_or_else(|| self.deps.files.clone(), |s| s.files.clone());
-            return self.hold(to, media, ev, &dir);
         }
         let kind = if matches!(ev.what, What::Voice(_)) {
             Delivery::Voice
         } else {
             Delivery::Prompt
         };
+        let kept = Kept {
+            files: media.into_iter().cloned().collect(),
+            text: media.is_none().then(|| (text.clone(), kind)),
+            id: ev.id.clone(),
+            at: self.now(),
+        };
+        let Some(a) = mine.map_or_else(|| self.target(ev, &agents, Some(kept)), |a| Ok(Some(a)))?
+        else {
+            return Ok(());
+        };
+        if let Some(media) = media {
+            let to = match contact {
+                Some(_) => Holder::Own(a.pane_id.clone()),
+                None => Holder::Main(a.pane_id.clone()),
+            };
+            let dir = self.files_dir(a);
+            return self.hold(to, media, ev.id.as_deref(), &dir);
+        }
         self.deliver(
             a,
             &agents,
@@ -450,15 +535,109 @@ impl Bot {
                 chat: chat.as_ref(),
             },
         )
+        .map(|_| ())
+    }
+
+    /// Where files from the chat for `a` go; a confined agent reads only
+    /// its own.
+    fn files_dir(&self, a: &Agent) -> PathBuf {
+        self.sandbox(a)
+            .map_or_else(|| self.deps.files.clone(), |s| s.files.clone())
+    }
+
+    /// Hands the messages kept for want of an agent to `a`, the agent now
+    /// attached, unless they are too old: their files with their text as
+    /// one prompt, else their text.
+    pub(super) fn send_kept(&mut self, a: &Agent, agents: &[Agent]) -> Result<()> {
+        let Some(kept) = self.kept.take() else {
+            return Ok(());
+        };
+        if due(self.now(), kept.at, FOLLOW_UP) {
+            return Ok(());
+        }
+        let sent = if kept.files.is_empty() {
+            match &kept.text {
+                Some((text, kind)) => self.deliver(
+                    a,
+                    agents,
+                    Message {
+                        id: kept.id.as_deref(),
+                        text,
+                        kind: *kind,
+                        chat: None,
+                    },
+                )?,
+                None => false,
+            }
+        } else {
+            let to = Holder::Main(a.pane_id.clone());
+            let dir = self.files_dir(a);
+            for media in &kept.files {
+                self.hold(to.clone(), media, kept.id.as_deref(), &dir)?;
+            }
+            let i = self.held_files.iter().position(|h| h.to == to);
+            match i.map(|i| self.held_files.remove(i)) {
+                Some(mut held) => {
+                    held.captions.extend(kept.text.map(|(text, _)| text));
+                    self.hand(&held, None)?
+                }
+                None => false,
+            }
+        };
+        if sent {
+            let said = format!("Sent your message to **{}**.", a.name);
+            self.say(&said, To::default().quiet())?;
+        }
+        Ok(())
+    }
+
+    /// Keeps a message that found no agent with those kept before, unless
+    /// they are too old; true when some were.
+    fn keep_unsent(&mut self, kept: Kept) -> bool {
+        let now = self.now();
+        let Some(old) = self.kept.as_mut().filter(|k| !due(now, k.at, FOLLOW_UP)) else {
+            self.kept = Some(kept);
+            return false;
+        };
+        old.files.extend(kept.files);
+        old.text = match (old.text.take(), kept.text) {
+            (Some((before, _)), Some((text, kind))) => Some((format!("{before}\n\n{text}"), kind)),
+            (before, text) => text.or(before),
+        };
+        old.id = kept.id.or(old.id.take());
+        old.at = kept.at;
+        true
+    }
+
+    /// The files held for the own chat in pane `from` are for the one in
+    /// pane `to`.
+    pub(super) fn move_held(&mut self, from: &str, to: &str) {
+        for held in &mut self.held_files {
+            if held.to.contact() == Some(from) {
+                held.to = Holder::Own(to.to_owned());
+            }
+        }
     }
 
     /// Hands the prompts `herdr-matrix prompt` queued to their agents, and
-    /// posts the files `herdr-matrix send` queued.
+    /// posts the files `herdr-matrix send` queued. Nothing is taken while
+    /// herdr cannot list the agents. A prompt herdr failed to send, and a
+    /// file the homeserver failed to take, is queued again.
     ///
     /// # Errors
     /// When a queue directory cannot be read, or herdr cannot list the
     /// agents.
     pub fn local(&mut self) -> Result<()> {
+        let sandboxes = self.deps.agents.iter().filter_map(|s| s.sandbox.as_ref());
+        let queues: Vec<&PathBuf> = [&self.deps.inbox, &self.deps.uploads]
+            .into_iter()
+            .flatten()
+            .chain(sandboxes.map(|s| &s.uploads))
+            .collect();
+        if !queues.into_iter().any(|dir| inbox::queued(dir)) {
+            return Ok(());
+        }
+        let agents = self.agents()?;
         let prompts = match self.deps.inbox.clone() {
             Some(dir) => inbox::take(&dir, &*self.deps.log)?,
             None => Vec::new(),
@@ -471,15 +650,15 @@ impl Bot {
         .map(|(upload, data)| (upload, data, None))
         .collect();
         uploads.extend(self.confined_uploads());
-        if prompts.is_empty() && uploads.is_empty() {
-            return Ok(());
-        }
-        let agents = self.agents();
         for (upload, data, cwd) in &uploads {
-            if let Ok(agents) = &agents {
-                match cwd {
-                    Some(cwd) => self.confined_upload(upload, data, cwd, agents),
-                    None => self.local_upload(upload, data, agents),
+            let again = match cwd {
+                Some(cwd) => self.confined_upload(upload, data, cwd, &agents),
+                None => self.local_upload(upload, data, &agents),
+            };
+            if again {
+                match inbox::requeue(upload, data) {
+                    Ok(()) => continue,
+                    Err(err) => self.log(&format!("error: {}: {err}", data.display())),
                 }
             }
             if let Err(err) = fs::remove_file(data)
@@ -488,7 +667,6 @@ impl Bot {
                 self.log(&format!("error: {}: {err}", data.display()));
             }
         }
-        let agents = agents?;
         for prompt in &prompts {
             if let Err(err) = self.local_prompt(prompt, &agents) {
                 self.log(&format!("error: prompts: {err}"));
@@ -499,27 +677,42 @@ impl Bot {
 
     /// The files the confined agents queued, each with the working
     /// directory of its agent. A queue that cannot be read holds nothing.
-    fn confined_uploads(&self) -> Vec<(Upload, PathBuf, Option<String>)> {
+    fn confined_uploads(&mut self) -> Vec<(Upload, PathBuf, Option<String>)> {
         let mut found = Vec::new();
-        for settings in &self.deps.agents {
-            let Some(sandbox) = settings.sandbox.as_ref() else {
-                continue;
-            };
-            match inbox::take_uploads(&sandbox.uploads, self.now(), &*self.deps.log) {
-                Ok(taken) => found.extend(
-                    taken
-                        .into_iter()
-                        .map(|(upload, data)| (upload, data, Some(settings.cwd.clone()))),
-                ),
-                Err(err) => self.log(&format!("error: uploads of {}: {err}", sandbox.id)),
-            }
+        let confined: Vec<(String, Sandbox)> = self
+            .deps
+            .agents
+            .iter()
+            .filter_map(|s| Some((s.cwd.clone(), s.sandbox.clone()?)))
+            .collect();
+        for (cwd, sandbox) in confined {
+            self.retry(
+                &format!("uploads of {}", sandbox.id),
+                Duration::ZERO,
+                |bot| {
+                    let taken = inbox::take_uploads(&sandbox.uploads, bot.now(), &*bot.deps.log)?;
+                    found.extend(
+                        taken
+                            .into_iter()
+                            .map(|(upload, data)| (upload, data, Some(cwd.clone()))),
+                    );
+                    Ok(())
+                },
+            );
         }
         found
     }
 
     /// Posts a file a confined agent queued, as the one agent working in
-    /// `cwd`: the queue names the agent, never the entry.
-    fn confined_upload(&mut self, upload: &Upload, data: &Path, cwd: &str, agents: &[Agent]) {
+    /// `cwd`: the queue names the agent, never the entry. True when it is
+    /// to be tried again.
+    fn confined_upload(
+        &mut self,
+        upload: &Upload,
+        data: &Path,
+        cwd: &str,
+        agents: &[Agent],
+    ) -> bool {
         let working: Vec<&Agent> = agents
             .iter()
             .filter(|a| a.cwd.as_deref().is_some_and(|dir| same_dir(dir, cwd)))
@@ -529,50 +722,74 @@ impl Bot {
                 "upload for \"{cwd}\" dropped: it matches {} agents",
                 working.len()
             ));
-            return;
+            return false;
         };
         let upload = Upload {
             pane: a.pane_id.clone(),
             ..upload.clone()
         };
-        self.local_upload(&upload, data, agents);
+        self.local_upload(&upload, data, agents)
     }
 
     /// Posts a file an agent queued in its own chat, else in the main chat;
-    /// one that fails is said there and logged.
-    fn local_upload(&mut self, upload: &Upload, data: &Path, agents: &[Agent]) {
+    /// one that fails is logged and said there. One the homeserver failed
+    /// to take is tried `UPLOAD_TRIES` times, `UPLOAD_RETRY` apart, while it
+    /// is not too old, and
+    /// said when it is dropped. True when it is to be tried again.
+    fn local_upload(&mut self, upload: &Upload, data: &Path, agents: &[Agent]) -> bool {
         let pane = upload.pane.as_str();
         let dropped = |why: &str| format!("upload for \"{pane}\" dropped: {why}");
+        let failed = self.failed_uploads.shift_remove(data);
+        let chat = self.state.spawned.get(pane).cloned();
+        let said = |err: &dyn fmt::Display| format!("Could not send {}: {err}", upload.name);
         if self.now() - upload.at > STALE.as_secs_f64() {
             let minutes = STALE.as_secs_f64() / 60.0;
             self.log(&dropped(&format!("older than {minutes:.0} minutes")));
-            return;
+            if let Some((err, ..)) = failed {
+                self.notice(&said(&err), To::chat(chat.as_ref()).quiet());
+            }
+            return false;
+        }
+        if let Some(waiting) = failed.clone()
+            && !super::due(self.now(), waiting.2, UPLOAD_RETRY)
+        {
+            self.failed_uploads.insert(data.to_owned(), waiting);
+            return true;
         }
         if !agents.iter().any(|a| a.pane_id == pane) {
             self.log(&dropped("no agent works there"));
-            return;
+            return false;
         }
-        let chat = self.state.spawned.get(pane).cloned();
         match self.post_file(upload, data, chat.as_ref()) {
             Ok(len) => self.log(&format!("{pane} upload {len}")),
             Err(err) => {
                 self.log(&format!("error: {pane} upload: {err}"));
-                self.notice(
-                    &format!("Could not send {}: {err}", upload.name),
-                    To::chat(chat.as_ref()).quiet(),
-                );
+                let tries = failed.map_or(0, |(_, tries, _)| tries) + 1;
+                if matches!(err, Error::Transport(_) | Error::Http { status: 500.., .. })
+                    && tries < UPLOAD_TRIES
+                {
+                    let failed = (err.to_string(), tries, self.now());
+                    self.failed_uploads.insert(data.to_owned(), failed);
+                    return true;
+                }
+                self.notice(&said(&err), To::chat(chat.as_ref()).quiet());
             }
         }
+        false
     }
 
-    /// Uploads a queued file within the homeserver's limit, and posts it so
-    /// that a reply to it reaches the agent; its size.
+    /// Uploads a queued file within the homeserver's limit, asked once per
+    /// run, and posts it so that a reply to it reaches the agent; its size.
     fn post_file(&mut self, upload: &Upload, data: &Path, chat: Option<&Chat>) -> Result<u64> {
         let mut file = files::open_inside(data.parent().unwrap_or(data), data)?;
         let len = file.metadata()?.len();
-        if let Some(limit) = self.matrix.upload_limit()?
-            && len > limit
-        {
+        let limit = match self.upload_limit {
+            Some(limit) => limit,
+            None => *self
+                .upload_limit
+                .insert(self.matrix.upload_limit()?.unwrap_or(u64::MAX)),
+        };
+        if len > limit {
             return Err(Error::Refused(format!(
                 "it is {}, and the homeserver takes {} at most",
                 megabytes(len, true),
@@ -628,12 +845,15 @@ impl Bot {
         let turn = self.turn(a);
         if let Err(err) = herdr::prompt(self.deps.herdr.as_mut(), pane, &prompt.text) {
             self.log(&format!("error: {pane} prompt: {err}"));
+            if let Some(dir) = &self.deps.inbox {
+                inbox::queue(dir, prompt)?;
+            }
             return Ok(());
         }
         self.log(&format!("{pane} local {}", prompt.text.chars().count()));
         self.state.asked.shift_remove(pane);
         let spawned = self.state.spawned.contains_key(pane);
-        self.expect(
+        let saved = self.expect(
             pane,
             &turn,
             Origin {
@@ -641,23 +861,67 @@ impl Bot {
                 spawned,
                 ..Origin::default()
             },
-        )?;
+        );
         self.waiting(pane).local = true;
-        self.save()
+        if saved { self.save() } else { Ok(()) }
     }
 
-    /// The agent of the message replied to, else the attached one.
-    pub(super) fn target<'a>(&self, ev: &Inbound, agents: &'a [Agent]) -> Option<&'a Agent> {
-        let pane = ev.reply_to.as_ref().and_then(|q| self.state.sent.get(q));
-        agents
-            .iter()
-            .find(|a| Some(&a.pane_id) == pane)
-            .or_else(|| self.attached(agents))
+    /// The agent of the message replied to, else the attached one; else
+    /// None, once the chat says why. A message, `kept`, that finds no agent
+    /// attached waits for the next `!attach`, with those kept before it.
+    pub(super) fn target<'a>(
+        &mut self,
+        ev: &Inbound,
+        agents: &'a [Agent],
+        kept: Option<Kept>,
+    ) -> Result<Option<&'a Agent>> {
+        let replied = ev.reply_to.as_ref().and_then(|q| self.state.sent.get(q));
+        let Some(pane) = replied.cloned() else {
+            if let Some(a) = self.attached(agents) {
+                return Ok(Some(a));
+            }
+            if self.state.attached.is_some() {
+                let said = not_running(self.attached_name());
+                self.say(&said, To::default())?;
+                return Ok(None);
+            }
+            let keeping = kept.is_some();
+            if let Some(kept) = kept
+                && self.keep_unsent(kept)
+            {
+                let said = "Kept with the rest; !attach an agent and I send it.";
+                self.say(said, To::default().quiet())?;
+                return Ok(None);
+            }
+            let head = match (agents.is_empty(), keeping) {
+                (true, true) => {
+                    "No agent is running, so nothing was sent. Start one with !new <folder>."
+                }
+                (true, false) => "No agent is running. Start one with !new <folder>.",
+                (false, true) => {
+                    "Nothing was sent: no agent is attached. !attach one and I send it:"
+                }
+                (false, false) => "No agent is attached. !attach one first:",
+            };
+            if agents.is_empty() {
+                self.say(head, To::default())?;
+            } else {
+                self.ask_which(head, agents)?;
+            }
+            return Ok(None);
+        };
+        if let Some(a) = agents.iter().find(|a| a.pane_id == pane) {
+            return Ok(Some(a));
+        }
+        self.say(&not_running(None), To::default())?;
+        Ok(None)
     }
 
     /// Hands a message to an agent: a prompt, or while it waits on a
-    /// choice, a key or a written answer to that choice.
-    fn deliver(&mut self, a: &Agent, agents: &[Agent], message: Message) -> Result<()> {
+    /// choice, a key or a written answer to that choice. A choice on screen
+    /// takes a key, written as a key or a word for one; a question takes
+    /// any other answer as written. True when it reached the agent.
+    fn deliver(&mut self, a: &Agent, agents: &[Agent], message: Message) -> Result<bool> {
         let Message {
             id,
             text,
@@ -666,18 +930,24 @@ impl Bot {
         } = message;
         let pane = a.pane_id.as_str();
         let turn = self.turn(a);
-        let lower = text.to_lowercase();
+        let mut key = text.to_lowercase();
         let mut written = None;
         if a.status == Status::Blocked {
             if self.changed(a, agents, &turn, chat)? {
-                return Ok(());
+                return Ok(false);
             }
             let asked = turn
                 .question
                 .as_ref()
                 .map(|q| q.list.as_slice())
                 .unwrap_or_default();
-            if KEYS.contains(&lower.as_str()) {
+            let pressed = if asked.is_empty() {
+                typed_key(text)
+            } else {
+                KEYS.iter().find(|k| **k == key).copied()
+            };
+            if let Some(pressed) = pressed {
+                key = pressed.to_owned();
                 kind = Delivery::Key;
             } else if let [q] = asked
                 && !q.multi_select
@@ -693,12 +963,12 @@ impl Bot {
                     ),
                     To::chat(chat).pane(pane),
                 )?;
-                return Ok(());
+                return Ok(false);
             }
         }
         let herdr = self.deps.herdr.as_mut();
         let sent = match (kind, written) {
-            (Delivery::Key, _) => herdr::send_keys(herdr, pane, &lower),
+            (Delivery::Key, _) => herdr::send_keys(herdr, pane, &key),
             (Delivery::Answer, Some(entry)) => write_answer(herdr, pane, &entry, text),
             _ => {
                 // Tells the agent where the owner reads; a slash command stays bare
@@ -712,9 +982,9 @@ impl Bot {
         };
         match sent {
             Err(Error::Herdr(out)) => {
-                let said = format!("Could not send to **{}**: {out}", a.name);
+                let said = herdr_failed("send to", &a.name, &out);
                 self.say(&said, To::chat(chat).pane(pane))?;
-                return Ok(());
+                return Ok(false);
             }
             other => other?,
         }
@@ -723,16 +993,14 @@ impl Bot {
         if kind != Delivery::Key {
             self.state.asked.shift_remove(pane);
         }
-        self.expect(
-            pane,
-            &turn,
-            Origin {
-                slash: text.starts_with('/'),
-                spawned: chat.is_some(),
-                ..Origin::default()
-            },
-        )?;
-        self.mark_read(id, chat)
+        let origin = Origin {
+            slash: text.starts_with('/'),
+            spawned: chat.is_some(),
+            ..Origin::default()
+        };
+        self.expect(pane, &turn, origin);
+        self.mark_read(id, chat)?;
+        Ok(true)
     }
 
     /// A read receipt tells the owner the agent has the message.

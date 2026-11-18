@@ -71,6 +71,9 @@ pub fn whisper(bins: &Bins, audio: &Path, model: &str, language: &str) -> Result
             "-nostdin",
             "-loglevel",
             "error",
+            // A playlist in the recording would open its addresses
+            "-protocol_whitelist",
+            "file,pipe",
             "-i",
             &audio,
             "-ar",

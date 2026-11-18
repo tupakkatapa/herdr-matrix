@@ -126,11 +126,22 @@ pub fn open_inside(root: &Path, path: &Path) -> std::io::Result<fs::File> {
             format!("{}: not a regular file", path.display()),
         )
     };
-    // Opening a FIFO would wait for a writer
+    // Opening a FIFO or a device may wake who holds its other end
     if !fs::symlink_metadata(path)?.is_file() {
         return Err(refused());
     }
-    let file = fs::File::open(path)?;
+    // A FIFO opens at once, and a symlink as the last part does not
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|err| {
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                refused()
+            } else {
+                err
+            }
+        })?;
     // Where the open file is, as the kernel resolved it
     let opened = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
     let below = path.strip_prefix(root).map_err(|_| refused())?;
@@ -284,6 +295,51 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn fifo_is_refused_at_once() {
+        let dir = TempDir::new();
+        let root = dir.path().to_owned();
+        let fifo = root.join("a.jsonl");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(open_inside(&root, &fifo).is_err()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
+    }
+
+    #[test]
+    fn fifo_behind_a_linked_folder_is_not_opened() {
+        let dir = TempDir::new();
+        let root = dir.path().join("root");
+        let real = dir.path().join("real");
+        for d in [&root, &real] {
+            fs::create_dir_all(d).expect("mkdir");
+        }
+        let fifo = real.join("a.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        std::os::unix::fs::symlink(&real, root.join("link")).expect("symlink");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = fifo.clone();
+        std::thread::spawn(move || {
+            tx.send(fs::OpenOptions::new().write(true).open(writer).is_ok())
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(open_inside(&root, &root.join("link/a.json")).is_err());
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "opened"
+        );
+        drop(fs::OpenOptions::new().read(true).open(&fifo));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(true));
     }
 
     #[test]

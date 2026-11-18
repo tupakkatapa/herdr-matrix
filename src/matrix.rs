@@ -18,7 +18,7 @@ pub const TRANSFER_TIMEOUT: Duration = Duration::from_mins(1);
 /// How long the homeserver holds a sync open for new events
 pub const SYNC_WAIT: Duration = Duration::from_secs(3);
 /// How long a typing notice lasts unless renewed
-const TYPING_TIMEOUT: Duration = Duration::from_secs(10);
+pub const TYPING_TIMEOUT: Duration = Duration::from_secs(10);
 /// The wait after a rate limit that names none, and the longest one
 /// waited out
 const RATE_LIMIT_WAIT: Duration = Duration::from_secs(1);
@@ -363,8 +363,10 @@ impl Inbound {
                 };
                 match text("msgtype")? {
                     "m.text" => What::Text(unquoted(body, relates)),
-                    "m.image" | "m.file" | "m.video" => What::File(media()),
-                    "m.audio" => What::Voice(media()),
+                    "m.audio" if content.get("org.matrix.msc3245.voice").is_some() => {
+                        What::Voice(media())
+                    }
+                    "m.image" | "m.file" | "m.video" | "m.audio" => What::File(media()),
                     _ => return None,
                 }
             }
@@ -795,6 +797,26 @@ mod tests {
             })
         );
         assert_eq!((parsed.id.as_deref(), parsed.ts), (Some("$v"), 2.0));
+    }
+
+    #[test]
+    fn only_a_voice_message_is_heard() {
+        let audio = |extra: serde_json::Value| {
+            let mut content = serde_json::json!({"msgtype": "m.audio", "body": "song.mp3",
+                "url": "mxc://e.org/a"});
+            content
+                .as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            let ev = serde_json::json!({"type": "m.room.message", "sender": "@o:e.org",
+                "content": content});
+            Inbound::parse(&ev, "@o:e.org").expect("a message").what
+        };
+        assert!(matches!(audio(serde_json::json!({})), What::File(_)));
+        assert!(matches!(
+            audio(serde_json::json!({"org.matrix.msc3245.voice": {}})),
+            What::Voice(_)
+        ));
     }
 
     #[test]

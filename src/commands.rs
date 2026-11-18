@@ -30,7 +30,7 @@ pub const HELP: &str = concat!(
      key: ",
     key_hint!(),
     ". A \u{1F44D} on the message that shows the choice picks the first option.\n\n\
-     After !away, every agent that stops or waits posts here under its \
+     After !away, every agent that stops or asks posts here under its \
      name, until !here. Reply to such a message to answer that agent without \
      switching. A command acts on the agent of the message you reply to, \
      else on the attached one."
@@ -42,8 +42,8 @@ pub fn contact(name: &str) -> String {
     format!(
         "This chat is {name}'s own: what you write here goes to it alone, and \
          what it says comes back here as it works. Pictures, files, voice \
-         messages and answers work as in the main chat. !leave ends this chat; \
-         the agent keeps running."
+         messages and answers work as in the main chat. !leave closes this \
+         chat; the agent keeps running."
     )
 }
 
@@ -123,15 +123,15 @@ pub const COMMANDS: [Command; 12] = [
     Command {
         cmd: Cmd::Attach,
         name: "attach",
-        spoken: Some(".*"),
+        spoken: Some(r"\S*"),
         main: Some("!attach <name> - talk to that agent"),
         contact: None,
     },
     Command {
         cmd: Cmd::New,
         name: "new",
-        spoken: Some(".*"),
-        main: Some("!new <folder> - start an agent there"),
+        spoken: Some(r"\S*"),
+        main: Some("!new [folder] - start an agent there, or list folders"),
         contact: None,
     },
     Command {
@@ -145,8 +145,8 @@ pub const COMMANDS: [Command; 12] = [
         cmd: Cmd::Leave,
         name: "leave",
         spoken: None,
-        main: Some("!leave <name> - end its own chat"),
-        contact: Some("!leave - end this chat"),
+        main: Some("!leave <name> - close its own chat; it keeps running"),
+        contact: Some("!leave - close this chat; the agent keeps running"),
     },
     both(Cmd::Last, "last", "", "!last - what it said last"),
     both(
@@ -155,37 +155,84 @@ pub const COMMANDS: [Command; 12] = [
         r"\d*",
         "!screen [n] - its screen, n <= 200 lines",
     ),
-    both(Cmd::Stop, "stop", "", "!stop - interrupt it"),
+    both(Cmd::Stop, "stop", "", "!stop - interrupt what it is doing"),
     Command {
         cmd: Cmd::Exit,
         name: "exit",
         spoken: None,
-        main: Some("!exit - end it and close its pane"),
-        contact: Some("!exit - end it and close its pane"),
+        main: Some("!exit - quit the agent and close its pane (asks first)"),
+        contact: Some("!exit - quit the agent and close its pane (asks first)"),
     },
-    both(Cmd::Away, "away", "", "!away - agents post when they stop"),
+    both(
+        Cmd::Away,
+        "away",
+        "",
+        "!away - every agent posts here when it stops or asks",
+    ),
     both(
         Cmd::Here,
         "here",
         "",
-        "!here - only replies to the chat post",
+        "!here - only answers to your messages come here",
     ),
     both(Cmd::Help, "help", "", "!help - this text"),
+];
+
+/// Other names of commands, and the command each stands for.
+const ALIASES: [(&str, &str); 9] = [
+    ("list", "agents"),
+    ("spawn", "dm"),
+    ("chat", "dm"),
+    ("kill", "leave"),
+    ("unchat", "leave"),
+    ("close", "exit"),
+    ("afk", "away"),
+    ("back", "here"),
+    ("auto", "here"),
 ];
 
 /// A command by its name or alias.
 #[must_use]
 pub fn command(word: &str) -> Option<&'static Command> {
-    let name = match word {
-        "list" => "agents",
-        "spawn" | "chat" => "dm",
-        "kill" | "unchat" => "leave",
-        "close" => "exit",
-        "afk" => "away",
-        "back" | "auto" => "here",
-        word => word,
-    };
+    let name = ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == word)
+        .map_or(word, |(_, name)| name);
     COMMANDS.iter().find(|c| c.name == name)
+}
+
+/// The command or alias that works in `place` and `word` is a slip of:
+/// the nearest within two edits, and at most half its letters.
+#[must_use]
+pub fn suggest(word: &str, place: Place) -> Option<&'static str> {
+    let most = (word.chars().count() / 2).min(2);
+    COMMANDS
+        .iter()
+        .map(|c| c.name)
+        .chain(ALIASES.iter().map(|(alias, _)| *alias))
+        .filter(|name| command(name).is_some_and(|c| c.help(place).is_some()))
+        .map(|name| (edits(word, name), name))
+        .filter(|(n, _)| *n <= most)
+        .min_by_key(|(n, _)| *n)
+        .map(|(_, name)| name)
+}
+
+/// The Levenshtein distance between two words.
+fn edits(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, x) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, y) in b.iter().enumerate() {
+            let next = (diagonal + usize::from(x != *y))
+                .min(row[j] + 1)
+                .min(row[j + 1] + 1);
+            diagonal = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
 }
 
 /// The commands of a chat.
@@ -223,9 +270,25 @@ fn spoken_key(word: &str) -> Option<&'static str> {
     })
 }
 
+/// The key a typed answer to a choice on screen names: a key, or a word
+/// for one, spaces and trailing punctuation aside.
+#[must_use]
+pub fn typed_key(text: &str) -> Option<&'static str> {
+    let word = text
+        .trim()
+        .trim_end_matches(|c: char| c.is_ascii_punctuation())
+        .trim_end()
+        .to_lowercase();
+    KEYS.iter()
+        .find(|k| **k == word)
+        .copied()
+        .or_else(|| spoken_key(&word))
+}
+
 /// A transcript as the owner would have typed it: a short utterance that
 /// names a key, or a command that can be spoken with what it takes, becomes
-/// that key or command; anything else stays as heard.
+/// that key or command; anything else stays as heard. `auto` is a word of
+/// speech, not the command.
 #[must_use]
 pub fn spoken(heard: &str) -> String {
     static NOISE: LazyLock<Regex> =
@@ -241,6 +304,7 @@ pub fn spoken(heard: &str) -> String {
         }
     }
     if let Some((first, rest)) = words.split_first()
+        && *first != "auto"
         && let Some(entry) = command(first)
         && let Some(takes) = entry.spoken
         && words.len() <= 3
@@ -264,5 +328,43 @@ mod tests {
         }
         assert!(KEY_HINT.starts_with("1-9"));
         assert!(HELP.contains(KEY_HINT));
+    }
+
+    #[test]
+    fn spoken_new_and_attach_take_one_word() {
+        assert_eq!(spoken("New tests, please."), "New tests, please.");
+        assert_eq!(spoken("Attach the parser one."), "Attach the parser one.");
+        assert_eq!(spoken("New beta."), "!new beta");
+        assert_eq!(spoken("Attach repo."), "!attach repo");
+        assert_eq!(spoken("New."), "!new");
+        assert_eq!(spoken("Auto."), "Auto.");
+        assert_eq!(spoken("Back."), "!back");
+    }
+
+    #[test]
+    fn typed_answer_names_a_key() {
+        for (typed, key) in [
+            ("2.", Some("2")),
+            ("y ", Some("y")),
+            ("Yes!", Some("y")),
+            (" No.", Some("n")),
+            ("Esc", Some("esc")),
+            ("two", Some("2")),
+            ("yes please", None),
+            ("...", None),
+        ] {
+            assert_eq!(typed_key(typed), key, "{typed}");
+        }
+    }
+
+    #[test]
+    fn slip_of_a_command_is_named() {
+        assert_eq!(suggest("atach", Place::Main), Some("attach"));
+        assert_eq!(suggest("stpo", Place::Main), Some("stop"));
+        assert_eq!(suggest("kil", Place::Main), Some("kill"));
+        assert_eq!(suggest("x", Place::Main), None);
+        assert_eq!(suggest("banana", Place::Main), None);
+        assert_eq!(suggest("atach", Place::Own), None);
+        assert_eq!(edits("kitten", "sitting"), 3);
     }
 }

@@ -166,6 +166,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "indexmap",
+ "libc",
  "regex",
  "serde",
  "serde_json",

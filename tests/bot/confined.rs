@@ -144,6 +144,65 @@ fn file_of_a_confined_agent_posts_as_the_agent_of_its_queue() {
 }
 
 #[test]
+fn queue_of_a_confined_agent_is_taken_five_at_a_time() {
+    let mut t = T::new();
+    let nora = confine(&mut t);
+    t.set("wA:p1", "idle");
+    let source = t.dir.path().join("notes.txt");
+    fs::write(&source, "hello").expect("write");
+    for i in 0..12 {
+        let upload = Upload {
+            pane: String::new(),
+            name: format!("{i:02}.txt"),
+            caption: None,
+            at: t.now() + f64::from(i) / 100.0,
+        };
+        let mut file = fs::File::open(&source).expect("open");
+        queue_upload(&nora.uploads, &upload, &mut file).expect("queued");
+    }
+    let mut counts = Vec::new();
+    for _ in 0..3 {
+        t.bot.local().expect("local");
+        counts.push(t.files_sent(None).len());
+    }
+    assert_eq!(counts, [5, 10, 12]);
+    let names: Vec<String> = t
+        .files_sent(None)
+        .iter()
+        .map(|e| e["filename"].as_str().expect("a name").to_owned())
+        .collect();
+    let want: Vec<String> = (0..12).map(|i| format!("{i:02}.txt")).collect();
+    assert_eq!(names, want);
+}
+
+#[test]
+fn long_name_of_a_confined_agents_file_is_cut() {
+    let mut t = T::new();
+    let nora = confine(&mut t);
+    t.set("wA:p1", "idle");
+    t.matrix.0.borrow_mut().limit = Some(1);
+    let source = t.dir.path().join("notes.txt");
+    fs::write(&source, "hello").expect("write");
+    let upload = Upload {
+        pane: String::new(),
+        name: "é".repeat(500_000),
+        caption: None,
+        at: t.now(),
+    };
+    let mut file = fs::File::open(&source).expect("open");
+    queue_upload(&nora.uploads, &upload, &mut file).expect("queued");
+    t.bot.local().expect("local");
+    let said = t.new_msgs();
+    assert_eq!(said.len(), 1, "{} notices", said.len());
+    assert!(
+        said[0].starts_with("Could not send éé"),
+        "{}",
+        &said[0][..40]
+    );
+    assert!(said[0].len() < 512, "{} bytes", said[0].len());
+}
+
+#[test]
 fn file_of_a_confined_agent_needs_one_agent_in_its_folder() {
     let mut t = T::new();
     let nora = confine(&mut t);
@@ -264,5 +323,176 @@ fn new_starts_a_confined_agent_through_its_command() {
         t.herdr.last(),
         c(&["pane", "run", "wN:p1", "exec herdr-matrix-agent-nora"])
     );
-    assert!(t.last_msg().contains(&format!("Started Claude in {beta}")));
+    assert!(
+        t.last_msg()
+            .contains(&format!("Started Claude Code as beta in {beta};"))
+    );
+}
+
+#[test]
+fn autostart_starts_a_confined_agent_through_its_command() {
+    let mut t = T::new();
+    let beta = t.dir.path().join("ws/beta");
+    fs::create_dir_all(&beta).expect("mkdir");
+    confine_beta(&mut t, &beta.to_string_lossy());
+    t.bot.deps_mut().agents[0].autostart = true;
+    for _ in 0..3 {
+        t.poll();
+    }
+    assert_eq!(workspaces_made(&t), 1);
+    assert!(t.herdr.calls().contains(&c(&[
+        "pane",
+        "run",
+        "wN:p1",
+        "exec herdr-matrix-agent-nora"
+    ])));
+}
+
+/// The confined agent `nora` works in `ws/beta`, written as `cwd`.
+fn confine_beta(t: &mut T, cwd: &str) {
+    t.bot.deps_mut().agents = vec![AgentSettings {
+        cwd: cwd.into(),
+        sandbox: Some(Sandbox {
+            id: "nora".into(),
+            state: "/c".into(),
+            uploads: "/u".into(),
+            files: "/f".into(),
+        }),
+        ..AgentSettings::default()
+    }];
+}
+
+fn workspaces_made(t: &T) -> usize {
+    t.herdr
+        .calls()
+        .iter()
+        .filter(|c| c[0] == "workspace" && c[1] == "create")
+        .count()
+}
+
+#[test]
+fn new_refuses_a_folder_inside_a_confined_agents_folder() {
+    let mut t = T::new();
+    let ws = t.dir.path().join("ws");
+    fs::create_dir_all(ws.join("beta/api")).expect("mkdir");
+    fs::create_dir_all(t.dir.path().join("home")).expect("mkdir");
+    symlink(t.dir.path().join("home"), ws.join("beta/home")).expect("symlink");
+    confine_beta(&mut t, &ws.join("beta").to_string_lossy());
+    for folder in ["api", "home"] {
+        t.tell(&format!("!new {folder}"));
+        let inside = ws.join("beta").join(folder);
+        assert_eq!(
+            t.last_msg(),
+            format!(
+                "{} is inside the folder of the confined agent nora; start it with !new beta.",
+                inside.display()
+            )
+        );
+    }
+    assert_eq!(workspaces_made(&t), 0);
+}
+
+#[test]
+fn new_refuses_a_symlink_into_a_confined_agents_folder() {
+    let mut t = T::new();
+    let ws = t.dir.path().join("ws");
+    fs::create_dir_all(ws.join("beta/api")).expect("mkdir");
+    symlink(ws.join("beta/api"), ws.join("api-link")).expect("symlink");
+    confine_beta(&mut t, &ws.join("beta").to_string_lossy());
+    t.tell("!new api-link");
+    assert!(
+        t.last_msg()
+            .contains("is inside the folder of the confined agent nora"),
+        "{}",
+        t.last_msg()
+    );
+    assert_eq!(workspaces_made(&t), 0);
+}
+
+#[test]
+fn new_starts_a_confined_agent_through_a_symlink_onto_its_folder() {
+    let mut t = T::new();
+    let ws = t.dir.path().join("ws");
+    fs::create_dir_all(ws.join("beta")).expect("mkdir");
+    symlink(ws.join("beta"), ws.join("beta-link")).expect("symlink");
+    confine_beta(&mut t, &format!("{}/", ws.join("beta").display()));
+    t.tell("!new beta-link");
+    assert_eq!(
+        t.herdr.last(),
+        c(&["pane", "run", "wN:p1", "exec herdr-matrix-agent-nora"])
+    );
+    t.tell("!new beta");
+    assert_eq!(
+        t.herdr.last(),
+        c(&["pane", "run", "wN:p1", "exec herdr-matrix-agent-nora"])
+    );
+}
+
+#[test]
+fn new_starts_other_folders_unconfined() {
+    let mut t = T::new();
+    let ws = t.dir.path().join("ws");
+    let project = t.dir.path().join("projects/gamma");
+    fs::create_dir_all(ws.join("beta")).expect("mkdir");
+    fs::create_dir_all(ws.join("alpha")).expect("mkdir");
+    fs::create_dir_all(&project).expect("mkdir");
+    symlink(&project, ws.join("gamma")).expect("symlink");
+    confine_beta(&mut t, &ws.join("beta").to_string_lossy());
+    for folder in ["alpha", "gamma"] {
+        t.tell(&format!("!new {folder}"));
+        assert_eq!(t.herdr.last(), c(&["pane", "run", "wN:p1", "claude"]));
+    }
+}
+
+#[test]
+fn second_pane_in_the_folder_has_its_own_turn() {
+    let mut t = T::new();
+    let nora = confine(&mut t);
+    transcript(&nora.state.join("projects/-w-a/s.jsonl"), "confined says");
+    t.herdr
+        .0
+        .borrow_mut()
+        .cwd
+        .insert("wA:p2".into(), "/w/a".into());
+    t.set("wA:p1", "idle");
+    t.set("wA:p2", "idle");
+    t.herdr
+        .0
+        .borrow_mut()
+        .kinds
+        .insert("wA:p1".into(), "claude".into());
+    t.said("wA:p2", &[("u1", "desk pane says")], None);
+    t.tell("!attach wA:p2");
+    t.tell("!last");
+    assert_eq!(t.last_msg(), "desk pane says");
+    t.tell("!attach wA:p1");
+    t.tell("!last");
+    assert_eq!(t.last_msg(), "confined says");
+    t.herdr
+        .0
+        .borrow_mut()
+        .kinds
+        .insert("wA:p2".into(), "claude".into());
+    t.tell("!last");
+    assert_eq!(t.last_msg(), "Nothing said yet.");
+}
+
+#[test]
+fn queue_that_is_not_private_is_logged_once() {
+    let mut t = T::new();
+    let nora = confine(&mut t);
+    t.set("wA:p1", "idle");
+    fs::set_permissions(&nora.uploads, fs::Permissions::from_mode(0o755)).expect("chmod");
+    fs::write(nora.uploads.join("1-x.json"), "{}").expect("write");
+    t.clear_log();
+    for _ in 0..3 {
+        t.advance(1.0);
+        t.bot.local().expect("local");
+    }
+    let errors = t
+        .log_lines()
+        .iter()
+        .filter(|l| l.starts_with("error: uploads of nora: "))
+        .count();
+    assert_eq!(errors, 1, "{:?}", t.log_lines());
 }

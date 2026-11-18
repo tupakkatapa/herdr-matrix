@@ -2,11 +2,14 @@
 # `package` and state directory it shares
 { lib
 , config
+, options
 , pkgs
 , ...
 }@args:
 let
   cfg = config.programs.herdr;
+  # This module defines `programs.herdr.matrix` only; herdr's own module the rest
+  herdrDefined = options.programs.herdr ? enable && options.programs.herdr ? package;
   # Only Home Manager's NixOS module passes it; the module system ignores a
   # `? null` default on a module argument
   osConfig = args.osConfig or null;
@@ -30,7 +33,7 @@ let
       text = lib.mkOption {
         type = lib.types.str;
         example = "wake";
-        description = "The prompt.";
+        description = "The prompt, as the agent gets it. A turn whose last message is exactly `NOOP` posts nothing. For a `pi` agent, a text that starts with `!` runs as a shell command.";
       };
       onCalendar = lib.mkOption {
         type = lib.types.str;
@@ -43,12 +46,7 @@ let
   stateVariable = { claude = "CLAUDE_CONFIG_DIR"; pi = "PI_CODING_AGENT_DIR"; };
   sandbox = kind: lib.types.submodule {
     options = {
-      enable = lib.mkEnableOption ''
-        the sandbox: the command `herdr-matrix-agent-<id>` runs {option}`program` in bubblewrap, and `!new` starts it for {option}`cwd`.
-        Inside, the agent has {option}`cwd` and its own state directory, read and write; the Nix store, `/etc`, `/run/current-system` and {option}`allow.readPaths`, read-only; an empty `/tmp` and home; no other process of the host; and only what {option}`allow` grants.
-        Its state directory is `$XDG_STATE_HOME/herdr-matrix/agents/<id>/<kind>`, in `CLAUDE_CONFIG_DIR` for Claude Code and `PI_CODING_AGENT_DIR` for pi. Files from the owner are in `$XDG_CACHE_HOME/herdr-matrix/agents/<id>`, read-only.
-        `HERDR_AGENT` names the kind, so herdr knows the agent.
-        Start it in a pane with `exec herdr-matrix-agent-<id>`. An agent started without the command is not confined. Without this option, the agent has full trust: it runs as this user and can do what this user can'';
+      enable = lib.mkEnableOption "the sandbox: the command `herdr-matrix-agent-<name>` runs {option}`programs.herdr.matrix.agents.<name>.sandbox.program` in bubblewrap";
       program = lib.mkOption {
         type = lib.types.nonEmptyListOf lib.types.str;
         default = [ kind ];
@@ -60,7 +58,7 @@ let
         type = lib.types.attrsOf lib.types.str;
         default = { };
         example = { ANTHROPIC_BASE_URL = "http://127.0.0.1:11434"; };
-        description = "Environment variables inside the sandbox. The agent gets only these, `HOME`, `PATH`, `TERM`, `LANG`, `HERDR_AGENT`, the variable of its state directory, and the variables of what {option}`allow` grants.";
+        description = "Environment variables inside the sandbox. The agent gets only these, `HOME`, `PATH`, `TERM`, `LANG`, `HERDR_AGENT`, the variable of its state directory, and the variables of what {option}`programs.herdr.matrix.agents.<name>.sandbox.allow` grants. The values are in the Nix store: each user and each confined agent on the host can read them. Do not put a secret here.";
       };
       files = lib.mkOption {
         type = lib.types.attrsOf lib.types.path;
@@ -70,6 +68,7 @@ let
           Files in the agent's state directory. The key is a path in the state directory; the value is the file.
           The command binds each file read-only at its path: the agent reads it and cannot change it, and each start shows the file of the current generation. A missing file stops the start.
           The mount point stays in the state directory as an empty file after the agent exits.
+          The files are in the Nix store: each user and each confined agent on the host can read them. Do not put a secret here.
         '';
       };
       allow = {
@@ -82,15 +81,15 @@ let
         network = lib.mkOption {
           type = lib.types.bool;
           default = true;
-          description = "The host's network, which an agent needs to reach its model. On, the agent reaches every service the host reaches, local ones and the host's abstract unix sockets too. Off, the agent has no network. On, `/run/systemd/resolve` is shown read-only when it exists, for name lookups.";
+          description = "Share the host's network with the agent, which it needs to reach its model. On, the agent shares the host's network namespace: it reaches each service on the host's loopback addresses and each abstract unix socket. A service that trusts a local caller or this user's uid trusts the agent, as an X server that accepts local users by uid (Xwayland with `SI:localuser`) does: the agent can read the clipboard and send input to X11 programs. On, `/run/systemd/resolve` is shown read-only when it exists, for name lookups. Off, the agent has no network. For an agent that needs only local services, set this to false and name the ports in {option}`programs.herdr.matrix.agents.<name>.sandbox.allow.ports`.";
         };
         ports = lib.mkOption {
           type = lib.types.attrsOf lib.types.str;
           default = { };
           example = { "11434" = "10.23.0.18:11444"; };
           description = ''
-            TCP addresses for an agent without {option}`network`. The key is a port inside the sandbox, from 1024 to 65535; the value is the address outside, `host:port`. Inside, `127.0.0.1:<key>` reaches the value, and no other address exists.
-            Each port is a user socket `herdr-matrix-port-<id>-<port>.socket` on `$XDG_RUNTIME_DIR/herdr-matrix/ports/<id>/<port>`, only for this user; its service, `systemd-socket-proxyd`, connects to the value.
+            Give an agent without the network fixed TCP addresses. It needs {option}`programs.herdr.matrix.agents.<name>.sandbox.allow.network` off. The key is a port inside the sandbox, from 1024 to 65535; the value is the address outside, `host:port`. Inside, `127.0.0.1:<key>` reaches the value, and no other address exists.
+            Each port is a user socket `herdr-matrix-port-<name>-<port>.socket` on `$XDG_RUNTIME_DIR/herdr-matrix/ports/<name>/<port>`, only for this user; its service, `systemd-socket-proxyd`, connects to the value.
             The command binds that directory read-only, starts a `socat` per port on `127.0.0.1` in the sandbox, then the agent. While the directory is missing, the command stops with an error.
           '';
         };
@@ -100,25 +99,25 @@ let
             default = false;
             description = ''
               `herdr-matrix chats rooms`, `read` and `search`, through a socket of the chat gate for this agent only.
-              The socket is `/run/herdr-matrix-gate/<user>.<id>/socket`, served by the system units `herdr-matrix-gate-<user>.<id>.socket` and `herdr-matrix-gate-<user>.<id>@.service`. It needs {option}`programs.herdr.matrix.gate.enable`.
+              The socket is `/run/herdr-matrix-gate/<user>.<name>/socket`, served by the system units `herdr-matrix-gate-<user>.<name>.socket` and `herdr-matrix-gate-<user>.<name>@.service`. It needs {option}`programs.herdr.matrix.gate.enable`.
             '';
           };
           send = lib.mkOption {
             type = lib.types.bool;
             default = false;
-            description = "`herdr-matrix chats rooms` and `send`, through the same socket. Without {option}`read`, the agent sends and sees the names of the chats, not their messages.";
+            description = "`herdr-matrix chats rooms` and `send`, through the same socket. Without {option}`programs.herdr.matrix.agents.<name>.sandbox.allow.chats.read`, the agent sends and sees the names of the chats, not their messages.";
           };
           rooms = lib.mkOption {
             type = lib.types.listOf lib.types.str;
             default = [ ];
             example = [ "!abc:example.org" ];
-            description = "The room ids of the bridged chats that {option}`read` and {option}`send` reach. Empty, they reach every bridged chat.";
+            description = "Empty, {option}`programs.herdr.matrix.agents.<name>.sandbox.allow.chats.read` and {option}`programs.herdr.matrix.agents.<name>.sandbox.allow.chats.send` reach every bridged chat. Else, they reach only the bridged chats with these room ids.";
           };
         };
         sendFiles = lib.mkOption {
           type = lib.types.bool;
           default = true;
-          description = "`herdr-matrix send`: the agent posts files in its chat with the owner, who already gets every text of the agent. The bot takes the agent from the directory of the queue, `$XDG_CACHE_HOME/herdr-matrix/uploads/<id>`.";
+          description = "`herdr-matrix send`: the agent posts files in its chat with the owner, who already gets every text of the agent. The bot takes the agent from the directory of the queue, `$XDG_CACHE_HOME/herdr-matrix/uploads/<name>`.";
         };
       };
     };
@@ -128,42 +127,78 @@ let
       cwd = lib.mkOption {
         type = lib.types.str;
         example = "/home/alice/Workspace/assistant";
-        description = "The working directory of the agent; a trailing `/` aside, it must equal the agent's. It takes no systemd specifier such as `%h`.";
+        description = ''
+          Absolute path of the folder the agent works in. It must equal the working directory herdr reports for the agent; a trailing `/` is ignored.
+          Each agent has its own folder. `!new` lists the folders of {option}`programs.herdr.matrix.workspace`; `!new <part of a name>` looks one or two levels deep.
+          It takes no systemd specifier such as `%h`.
+        '';
       };
       kind = lib.mkOption {
         type = lib.types.enum [ "claude" "pi" ];
         default = "claude";
-        description = "The agent program: Claude Code or pi. `!new` starts it in {option}`cwd`. It sets the default of {option}`sandbox.program` and the state directory in the sandbox. For an agent without a sandbox, the bot takes the kind from herdr.";
+        description = "The agent program: Claude Code or pi. `!new` starts it in {option}`programs.herdr.matrix.agents.<name>.cwd`. It sets the default of {option}`programs.herdr.matrix.agents.<name>.sandbox.program` and the state directory in the sandbox. For an agent without a sandbox, the bot takes the kind from herdr.";
+      };
+      displayName = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = config.name;
+        defaultText = lib.literalExpression "null";
+        example = "Kate";
+        description = "The display name of the user of this agent's own chat (`!dm`). Unset, it is herdr's name for the agent. The agent's name in `!attach`, `!agents` and `herdr-matrix prompt` stays herdr's.";
       };
       name = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
-        example = "Kate";
-        description = "The name of the agent's own chat user, in place of the agent's name. The agent keeps its herdr name for `!attach`, `!agents` and `herdr-matrix prompt`.";
+        visible = false;
+        description = "The old name of {option}`programs.herdr.matrix.agents.<name>.displayName`.";
       };
       prefix = lib.mkOption {
         type = lib.types.nullOr lib.types.bool;
         default = null;
-        description = "Put {option}`displayName` before the name of the agent's own chat user. Unset, {option}`spawnPrefix` decides.";
+        description = "Put the bot's {option}`programs.herdr.matrix.displayName` before the name of the user of this agent's own chat (`!dm`). Unset, {option}`programs.herdr.matrix.ownChat.prefix` decides.";
       };
       avatar = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
-        description = "The picture of the agent's own chat user, a PNG. Unset, it is {option}`spawnAvatar`.";
+        description = "The picture of the user of this agent's own chat (`!dm`), a PNG. Unset, it is {option}`programs.herdr.matrix.ownChat.avatar`.";
+      };
+      chat = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          The bot opens the agent's own chat when it starts the agent (`!new`, {option}`programs.herdr.matrix.agents.<name>.autostart`). Without this, `!dm` opens one.
+          A pane reports its own folder, so the bot opens a chat without a command only for an agent it started.
+          The chat stays while the agent is in the configuration, also while the agent is not running. It follows the agent to a new pane when the bot starts the agent. After a start by hand, `!dm <agent>` continues the same chat.
+          After `!leave`, the bot opens no chat for the agent until `!dm`, also after a restart.
+        '';
+      };
+      autostart = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          The bot starts the agent once when it comes up and the agent is not running. It starts it as `!new` does: a new herdr workspace in {option}`programs.herdr.matrix.agents.<name>.cwd`, with the command `herdr-matrix-agent-<name>` for a confined agent, else the program of {option}`programs.herdr.matrix.agents.<name>.kind`. The main chat stays as it is. With {option}`programs.herdr.matrix.agents.<name>.chat`, the bot opens the agent's own chat.
+          The bot does not start the agent again in the same run: not after the agent exits, and not after a start that fails. When herdr fails and lists again, the bot starts the agents that it did not start yet. When {option}`programs.herdr.matrix.agents.<name>.cwd` is missing, the bot logs it and does not start the agent.
+        '';
       };
       prompts = lib.mkOption {
         type = lib.types.attrsOf prompt;
         default = { };
         example = { wake = { text = "wake"; onCalendar = "hourly"; }; };
         description = ''
-          Prompts the agent gets on a schedule. Each one is a user service and timer `herdr-matrix-prompt-<id>-<name>`.
-          The bot drops a prompt when no agent or more than one works in {option}`cwd`, when the agent works or waits on a choice, or when the bot is down for 10 minutes; `journalctl --user -u herdr-matrix` says why.
+          Prompts the agent gets on a schedule. Each one is a user service and timer `herdr-matrix-prompt-<agent>-<prompt>`, where `<agent>` and `<prompt>` are the attribute names of the agent and the prompt.
+          The bot drops a prompt when no agent or more than one works in {option}`programs.herdr.matrix.agents.<name>.cwd`, when the agent works or waits on a choice, or when the bot is down for 10 minutes; `journalctl --user -u herdr-matrix` says why.
         '';
       };
       sandbox = lib.mkOption {
         type = sandbox config.kind;
         default = { };
-        description = "The confinement of the agent.";
+        description = ''
+          The confinement of the agent. Without {option}`programs.herdr.matrix.agents.<name>.sandbox.enable`, the agent has full trust: it runs as this user and can do what this user can.
+          With it, the command `herdr-matrix-agent-<name>` runs {option}`programs.herdr.matrix.agents.<name>.sandbox.program` in bubblewrap, and `!new` starts it for {option}`programs.herdr.matrix.agents.<name>.cwd`. Start it in a pane with `exec herdr-matrix-agent-<name>`, or let {option}`programs.herdr.matrix.agents.<name>.autostart` start it. An agent started without the command is not confined.
+          Inside, the agent has {option}`programs.herdr.matrix.agents.<name>.cwd` and its own state directory, read and write; the Nix store, `/etc`, `/run/current-system` and {option}`programs.herdr.matrix.agents.<name>.sandbox.allow.readPaths`, read-only; an empty `/tmp` and home; no other process of the host; and only what {option}`programs.herdr.matrix.agents.<name>.sandbox.allow` grants.
+          Its state directory is `$XDG_STATE_HOME/herdr-matrix/agents/<name>/<kind>`, in `CLAUDE_CONFIG_DIR` for Claude Code and `PI_CODING_AGENT_DIR` for pi. Files from the owner are in `$XDG_CACHE_HOME/herdr-matrix/agents/<name>`, read-only.
+          `HERDR_AGENT` names the kind, so herdr knows the agent.
+          `!new` and a start by hand run this user's shell in {option}`programs.herdr.matrix.agents.<name>.cwd` before the command starts. A shell hook that runs code from the folder, such as direnv with an allowed `.envrc`, runs it outside the sandbox.
+        '';
       };
     };
   });
@@ -201,8 +236,29 @@ let
   # Set apart from the defaults, so a sandbox option without `enable` is refused
   chats = s: s.allow.chats.read || s.allow.chats.send;
   customised = a:
-    let s = a.sandbox; in s.program != [ a.kind ] || s.environment != { } || s.files != { } || s.allow.readPaths != [ ]
-      || !s.allow.network || s.allow.ports != { } || chats s || s.allow.chats.rooms != [ ] || !s.allow.sendFiles;
+    let s = a.sandbox; in
+    lib.optional (s.program != [ a.kind ]) "sandbox.program"
+    ++ lib.optional (s.environment != { }) "sandbox.environment"
+    ++ lib.optional (s.files != { }) "sandbox.files"
+    ++ lib.optional (s.allow.readPaths != [ ]) "sandbox.allow.readPaths"
+    ++ lib.optional (!s.allow.network) "sandbox.allow.network"
+    ++ lib.optional (s.allow.ports != { }) "sandbox.allow.ports"
+    ++ lib.optional s.allow.chats.read "sandbox.allow.chats.read"
+    ++ lib.optional s.allow.chats.send "sandbox.allow.chats.send"
+    ++ lib.optional (s.allow.chats.rooms != [ ]) "sandbox.allow.chats.rooms"
+    ++ lib.optional (!s.allow.sendFiles) "sandbox.allow.sendFiles";
+  # For the messages of the assertions
+  show = lib.generators.toPretty { multiline = false; };
+  agentOption = id: "programs.herdr.matrix.agents.${lib.strings.escapeNixIdentifier id}";
+  sentence = xs: if lib.length xs < 2 then lib.concatStrings xs else "${lib.concatStringsSep ", " (lib.init xs)} and ${lib.last xs}";
+  # A name with each character outside `[A-Za-z0-9_-]` replaced by `-`
+  rename = name: lib.concatMapStrings (c: if builtins.match "[A-Za-z0-9_-]" c != null then c else "-") (lib.stringToCharacters name);
+  # As the bot's `safe_url`: the token goes in clear text over plain HTTP
+  safeUrl = url: lib.hasPrefix "https://" url
+    || builtins.match "http://((localhost|127(\\.[0-9]+){3})(:[^/]*)?|\\[[0:.]*1(][^/]*)?)(/.*)?" url != null;
+  # The characters of a systemd unit name
+  unitName = name: builtins.match "[A-Za-z0-9:_.\\\\@-]*" name != null;
+  unitChars = "letters, digits, `-`, `_`, `.`, `:`, `@` and `\\`";
   # No `--new-session`: herdr finds the agent in the pane's foreground
   # process group. bwrap applies `--clearenv` and `--setenv` in order.
   wrapper = id: a:
@@ -260,8 +316,13 @@ let
     '');
   agentsFile = pkgs.writeText "herdr-matrix-agents.json" (builtins.toJSON (lib.mapAttrsToList
     (id: a: {
-      inherit (a) cwd name prefix;
+      inherit (a) cwd prefix;
+      name = a.displayName;
       avatar = if a.avatar == null then null else "${a.avatar}";
+    } // lib.optionalAttrs a.chat {
+      inherit (a) chat;
+    } // lib.optionalAttrs a.autostart {
+      inherit (a) autostart;
     } // lib.optionalAttrs (a.kind != "claude") {
       inherit (a) kind;
     } // lib.optionalAttrs a.sandbox.enable {
@@ -291,36 +352,55 @@ let
   };
 in
 {
+  imports = [
+    (lib.mkRenamedOptionModule [ "programs" "herdr" "matrix" "spawnAvatar" ] [ "programs" "herdr" "matrix" "ownChat" "avatar" ])
+    (lib.mkRenamedOptionModule [ "programs" "herdr" "matrix" "spawnPrefix" ] [ "programs" "herdr" "matrix" "ownChat" "prefix" ])
+  ];
+
   options.programs.herdr = {
     matrix = {
-      enable = lib.mkEnableOption ''
-        a Matrix chat with the herdr agents: it takes prompts, files, voice messages and answers, and while away is on, posts every agent that stops or waits.
-        It needs {option}`programs.herdr.enable`. Its access token comes from `HERDR_MATRIX_TOKEN` in {option}`environmentFile`.
-        It keeps its state in `matrix-state.json` in herdr's state directory (a broken file is moved to `matrix-state.json.broken`),
-        and files of the chat for 30 days in `$XDG_CACHE_HOME/herdr-matrix`, else `~/.cache/herdr-matrix`.
-        `herdr-matrix send <file> [caption]...` in an agent's pane posts a file in the agent's chat; the package is in `home.packages`.
-        `!help` in the chat lists the commands; `journalctl --user -u herdr-matrix` shows errors and one line per delivered message, never its text
-      '';
+      enable = lib.mkEnableOption "a Matrix chat with the herdr agents, the user service `herdr-matrix`";
       package = lib.mkOption {
         type = lib.types.package;
         default = pkgs.callPackage ./package.nix { };
         defaultText = lib.literalExpression "pkgs.callPackage ./package.nix { }";
-        description = "The herdr-matrix package to use.";
+        description = "The herdr-matrix package. It is in `home.packages`, so `herdr-matrix` works in an agent's pane.";
       };
       homeserver = lib.mkOption {
         type = lib.types.str;
         example = "https://matrix.example.org";
-        description = "Client-server API base URL: `https://`, or `http://` on this host only.";
+        description = "Client-server API base URL: `https://`, or `http://` to `localhost`, `127.0.0.1` or `[::1]`. The bot sends its token with each request.";
       };
       owner = lib.mkOption {
         type = lib.types.str;
         example = "@alice:example.org";
-        description = "The only Matrix user the bot listens to and invites. To replace a lost chat, invite the bot to a new direct chat with only this user.";
+        description = ''
+          The only Matrix user the bot listens to and invites. The bot takes the owner's prompts, files, voice messages and answers. While away is on (`!away`), it posts each agent that stops or waits.
+          To replace a lost chat, invite the bot to a new direct chat with only this user.
+        '';
+      };
+      tokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.externalPath;
+        default = null;
+        example = "/run/agenix/herdr-matrix-token";
+        description = ''
+          File with the `as_token` of the appservice registration and nothing else, outside the Nix store. Whitespace around it is ignored. Set this or {option}`programs.herdr.matrix.environmentFile`.
+          systemd passes it to the bot as the credential `token`. The user manager reads it, so this user must be able to read it.
+          While it is missing, the service fails and retries every 10 s. After a change, restart `herdr-matrix`.
+        '';
       };
       environmentFile = lib.mkOption {
-        type = lib.types.str;
+        type = lib.types.nullOr lib.types.str;
+        default = null;
         example = "/run/agenix/herdr-matrix-env";
-        description = "File defining `HERDR_MATRIX_TOKEN`, the `as_token` of the appservice registration. While it is missing, the service fails and retries every 10 s; after a change, restart `herdr-matrix`.";
+        description = "File with the line `HERDR_MATRIX_TOKEN=<as_token>`, where `<as_token>` is the `as_token` of the appservice registration. Set this or {option}`programs.herdr.matrix.tokenFile`. While it is missing, the service fails and retries every 10 s. After a change, restart `herdr-matrix`.";
+      };
+      workspace = lib.mkOption {
+        type = lib.types.str;
+        default = "${config.home.homeDirectory}/Workspace";
+        defaultText = lib.literalExpression ''"''${config.home.homeDirectory}/Workspace"'';
+        example = "/srv/code";
+        description = "The folder of the projects. `!new` lists its folders; `!new <part of a name>` looks one or two levels deep. It starts an agent in the folder the owner picks.";
       };
       displayName = lib.mkOption {
         type = lib.types.str;
@@ -333,16 +413,16 @@ in
         defaultText = lib.literalExpression ''"''${config.programs.herdr.package.src}/assets/logo.png"'';
         description = "The bot's picture, a PNG. The default is the herdr logo from the source of {option}`programs.herdr.package`.";
       };
-      spawnAvatar = lib.mkOption {
+      ownChat.avatar = lib.mkOption {
         type = lib.types.path;
         default = cfg.matrix.avatar;
         defaultText = lib.literalExpression "config.programs.herdr.matrix.avatar";
-        description = "The picture of the user that speaks in an agent's own chat (`!dm`), a PNG.";
+        description = "The picture of the user of an agent's own chat (`!dm`), a PNG. An agent's {option}`programs.herdr.matrix.agents.<name>.avatar` replaces it.";
       };
-      spawnPrefix = lib.mkOption {
+      ownChat.prefix = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Put {option}`displayName` before the agent's name in the name of an agent's own chat user, as `herdr · repo`. Off, the name is the agent's alone. The name follows the agent when it changes.";
+        description = "Put {option}`programs.herdr.matrix.displayName` before the agent's name in the name of the user of an agent's own chat (`!dm`), as `herdr · repo`. Off, the name is the agent's alone. The name follows the agent when it changes. An agent's {option}`programs.herdr.matrix.agents.<name>.prefix` replaces it.";
       };
       transcribe.model = lib.mkOption {
         type = lib.types.nullOr download;
@@ -369,28 +449,29 @@ in
           {
             assistant = {
               cwd = "''${config.home.homeDirectory}/Workspace/assistant";
-              name = "Kate";
+              displayName = "Kate";
               prefix = false;
+              chat = true;
               avatar = ./kate.png;
               prompts.wake = { text = "wake"; onCalendar = "hourly"; };
             };
           }
         '';
-        description = "Settings per agent, each for the agent working in its {option}`cwd`. The attribute name is used in unit names and, for a confined agent, in the names of its command, directories and socket.";
+        description = "Settings per agent, each for the agent working in its {option}`programs.herdr.matrix.agents.<name>.cwd`. The attribute name is used in unit names and, for a confined agent, in the names of its command, directories and socket. `<name>` in the descriptions of these options is this attribute name.";
       };
       gate = {
-        enable = lib.mkEnableOption ''
-          the chat gate: this user's agents read, search and send in the owner's bridged chats with `herdr-matrix chats`.
-          It needs {option}`programs.herdr.matrix.enable` and the NixOS module `herdr-matrix.nixosModules.default`, which runs it; standalone Home Manager cannot.
-          The user gets the socket `/run/herdr-matrix-gate/<user>`, which only that user can open, and the system units `herdr-matrix-gate-<user>.socket` and `herdr-matrix-gate-<user>@.service`.
-          The gate runs as the system user `herdr-matrix-gate`, one process per request, and refuses every room that holds the bot or one of its users.
-          These options are system configuration: systemd reads {option}`tokenFile` as root and sends the token to {option}`programs.herdr.matrix.homeserver`. Do not let an untrusted user write this Home Manager configuration.
-          `journalctl -u 'herdr-matrix-gate-*'` shows one line per request: the command and the outcome, never the token, a message or a room name
-        '';
+        enable = lib.mkEnableOption "the chat gate: this user's agents read, search and send in the owner's bridged chats with `herdr-matrix chats`";
         tokenFile = lib.mkOption {
           type = lib.types.externalPath;
           example = "/run/agenix/matrix-gate-token";
-          description = "File with the owner's access token, outside the Nix store. systemd passes it to the gate as a credential, so it may stay `root:root`, mode `0400`, out of this user's reach.";
+          description = ''
+            File with the owner's access token, outside the Nix store. systemd passes it to the gate as a credential, so it may stay `root:root`, mode `0400`, out of this user's reach.
+            The gate needs {option}`programs.herdr.matrix.enable` and the NixOS module `herdr-matrix.nixosModules.default`, which runs it; standalone Home Manager cannot.
+            The user gets the socket `/run/herdr-matrix-gate/<user>`, which only that user can open, and the system units `herdr-matrix-gate-<user>.socket` and `herdr-matrix-gate-<user>@.service`.
+            The gate runs as the system user `herdr-matrix-gate`, one process per request, and refuses every room that holds the bot or one of its users.
+            The gate options are system configuration: systemd reads this file as root and sends the token to {option}`programs.herdr.matrix.homeserver`. Do not let an untrusted user write this Home Manager configuration.
+            `journalctl -u 'herdr-matrix-gate-*'` shows one line per request: the command and the outcome, never the token, a message or a room name.
+          '';
         };
         bridges = lib.mkOption {
           type = lib.types.listOf lib.types.str;
@@ -411,69 +492,124 @@ in
       assertions = [
         {
           assertion = cfg.matrix.enable;
-          message = "programs.herdr.matrix.gate.enable needs programs.herdr.matrix.enable.";
+          message = "programs.herdr.matrix.enable = false: programs.herdr.matrix.gate.enable needs the chat. Set programs.herdr.matrix.enable = true.";
         }
         {
           assertion = osConfig != null && (osConfig.herdr-matrix.gate.present or false);
-          message = "programs.herdr.matrix.gate.enable needs the NixOS module: import herdr-matrix.nixosModules.default in the NixOS configuration. Standalone Home Manager cannot run the gate.";
+          message = "programs.herdr.matrix.gate.enable = true: the gate runs as a system service, which only the NixOS module makes; standalone Home Manager cannot run it. Import herdr-matrix.nixosModules.default in the NixOS configuration, and run Home Manager as its NixOS module.";
         }
       ];
     })
     (lib.mkIf cfg.matrix.enable (lib.mkMerge [{
-      assertions = [{
-        assertion = cfg.enable;
-        message = "programs.herdr.matrix.enable needs programs.herdr.enable.";
-      }] ++ lib.concatLists (lib.mapAttrsToList
+      assertions = [
+        {
+          assertion = herdrDefined;
+          message = "programs.herdr.matrix needs a module that defines programs.herdr.enable and programs.herdr.package.";
+        }
+        {
+          assertion = !herdrDefined || cfg.enable;
+          message = "programs.herdr.enable = false: programs.herdr.matrix needs herdr. Set programs.herdr.enable = true.";
+        }
+        {
+          assertion = safeUrl cfg.matrix.homeserver;
+          message = "programs.herdr.matrix.homeserver = ${show cfg.matrix.homeserver}: the bot sends its token with each request, so the URL must be https://, or http:// to localhost, 127.0.0.1 or [::1]. Use the https:// URL of the homeserver.";
+        }
+        {
+          assertion = builtins.match "@[^:]+:.+" cfg.matrix.owner != null;
+          message = "programs.herdr.matrix.owner = ${show cfg.matrix.owner}: a Matrix user id has the form @local:server. Use the full id, such as \"@alice:example.org\".";
+        }
+        {
+          assertion = cfg.matrix.tokenFile != null || cfg.matrix.environmentFile != null;
+          message = "programs.herdr.matrix.tokenFile = null: the bot needs its as_token from tokenFile or environmentFile. Set programs.herdr.matrix.tokenFile.";
+        }
+        {
+          assertion = cfg.matrix.tokenFile == null || cfg.matrix.environmentFile == null;
+          message = "programs.herdr.matrix.tokenFile = ${show cfg.matrix.tokenFile}: programs.herdr.matrix.environmentFile is set too, and the bot takes its as_token from one file. Remove one of them.";
+        }
+      ]
+      ++ lib.concatLists (lib.mapAttrsToList
         (id: a:
           let
             s = a.sandbox;
             on = s.enable;
-            agent = "programs.herdr.matrix.agents.${id}";
+            agent = agentOption id;
+            cwd = "${agent}.cwd = ${show a.cwd}";
+            cwdParts = lib.filter (part: part != "") (lib.splitString "/" a.cwd);
+            set = customised a;
           in
           [
             {
-              assertion = on || !customised a;
-              message = "${agent}: the sandbox options need sandbox.enable.";
+              assertion = lib.hasPrefix "/" a.cwd;
+              message = "${cwd}: the folder must be an absolute path, as herdr reports it. Use a path such as \"\${config.home.homeDirectory}/Workspace/${id}\".";
+            }
+            {
+              assertion = a.prompts == { } || unitName id;
+              message = "${agent}: the attribute name of an agent with prompts goes into systemd unit names, so it takes only ${unitChars}. Rename it, such as ${show (rename id)}.";
+            }
+            {
+              assertion = on || set == [ ];
+              message = "${agent}: ${sentence set} ${if lib.length set > 1 then "are" else "is"} set, but sandbox.enable is false. Set sandbox.enable = true, or remove ${if lib.length set > 1 then "them" else "it"}.";
             }
             {
               assertion = !on || builtins.match "[A-Za-z0-9_-]+" id != null;
-              message = "${agent}: the name of a confined agent takes only letters, digits, `_` and `-`.";
+              message = "${agent}: the attribute name of a confined agent names its command, directories and socket, so it takes only letters, digits, `_` and `-`. Rename it, such as ${show (rename id)}.";
             }
             {
-              assertion = !on || !(lib.hasPrefix "${lib.removeSuffix "/" a.cwd}/" "${config.home.homeDirectory}/");
-              message = "${agent}: the cwd of a confined agent must not hold the home directory.";
+              assertion = !on || !lib.any (part: lib.elem part [ "." ".." ]) cwdParts;
+              message = "${cwd}: the folder of a confined agent must not hold a `.` or `..` part. Write the path without them.";
+            }
+            {
+              assertion = !on || !(lib.hasPrefix "/${lib.concatMapStrings (part: "${part}/") cwdParts}" "${config.home.homeDirectory}/");
+              message = "${cwd}: the folder of a confined agent must not hold the home directory. Use a folder inside it, such as ${show "${config.home.homeDirectory}/Workspace/${id}"}.";
             }
             {
               assertion = !on || !chats s || cfg.matrix.gate.enable;
-              message = "${agent}: sandbox.allow.chats needs programs.herdr.matrix.gate.enable.";
+              message = "${agent}.sandbox.allow.chats.${if s.allow.chats.read then "read" else "send"} = true: the agent's chats go through the chat gate. Set programs.herdr.matrix.gate.enable = true.";
             }
             {
               assertion = !on || s.allow.chats.rooms == [ ] || chats s;
-              message = "${agent}: sandbox.allow.chats.rooms needs sandbox.allow.chats.read or send.";
+              message = "${agent}.sandbox.allow.chats.rooms = ${show s.allow.chats.rooms}: the rooms limit sandbox.allow.chats.read and send, and neither is on. Set sandbox.allow.chats.read or sandbox.allow.chats.send to true, or remove the rooms.";
             }
             {
               assertion = !on || s.allow.ports == { } || !s.allow.network;
-              message = "${agent}: sandbox.allow.ports needs sandbox.allow.network = false.";
+              message = "${agent}.sandbox.allow.network = true: sandbox.allow.ports is the way to reach a service without the network, so it needs the network off. Set sandbox.allow.network = false, or remove sandbox.allow.ports.";
             }
           ]
           ++ map
+            (name: {
+              assertion = unitName name;
+              message = "${agent}.prompts.${lib.strings.escapeNixIdentifier name}: the name of a prompt goes into systemd unit names, so it takes only ${unitChars}. Rename it, such as ${show (rename name)}.";
+            })
+            (lib.attrNames a.prompts)
+          ++ map
             (key: {
               assertion = !on || lib.all (part: !lib.elem part [ "" "." ".." ]) (lib.splitString "/" key);
-              message = "${agent}: sandbox.files.\"${key}\" must be a path in the state directory, without an empty, `.` or `..` part.";
+              message = "${agent}.sandbox.files.${lib.strings.escapeNixIdentifier key}: the key must be a path in the state directory, without an empty, `.` or `..` part. Use a relative path, such as \"models.json\".";
             })
             (lib.attrNames s.files)
           ++ lib.concatLists (lib.mapAttrsToList
             (port: address: [
               {
                 assertion = !on || builtins.match "[1-9][0-9]{3,4}" port != null && lib.toInt port >= 1024 && lib.toInt port <= 65535;
-                message = "${agent}: sandbox.allow.ports.\"${port}\": the port inside must be a number from 1024 to 65535.";
+                message = "${agent}.sandbox.allow.ports.${lib.strings.escapeNixIdentifier port}: the key is the port inside the sandbox, a number from 1024 to 65535. Use a port in that range.";
               }
               {
                 assertion = !on || builtins.match "([A-Za-z0-9.-]+|\\[[0-9A-Fa-f:.]+]):[0-9]{1,5}" address != null;
-                message = "${agent}: sandbox.allow.ports.\"${port}\": the address outside must be `host:port`.";
+                message = "${agent}.sandbox.allow.ports.${lib.strings.escapeNixIdentifier port} = ${show address}: the address outside must be `host:port`. Write it as host:port, such as \"10.23.0.18:11444\" or \"[::1]:80\".";
               }
             ])
             s.allow.ports))
+        cfg.matrix.agents);
+      warnings = lib.concatLists
+        (lib.mapAttrsToList
+          (_: ids: lib.optional (lib.length ids > 1)
+            "${agentOption (lib.head ids)}.cwd = ${show cfg.matrix.agents.${lib.head ids}.cwd}: the agents ${sentence ids} work in the same folder, and the bot applies the settings of one agent per folder. Give each agent its own cwd.")
+          (lib.groupBy (id: lib.removeSuffix "/" cfg.matrix.agents.${id}.cwd) (lib.attrNames cfg.matrix.agents)))
+      ++ lib.concatLists (lib.mapAttrsToList
+        (id: a: lib.optional (a.name != null)
+          "${agentOption id}.name = ${show a.name}: the option is named displayName. Set ${agentOption id}.displayName."
+        ++ lib.optional (a.sandbox.enable && !a.sandbox.allow.network && a.sandbox.allow.ports == { })
+          "${agentOption id}.sandbox.allow.network = false: the agent has no network and no sandbox.allow.ports, so it cannot reach a model. Name the model's address in sandbox.allow.ports, or set sandbox.allow.network = true.")
         cfg.matrix.agents);
       home.packages = [ cfg.matrix.package ] ++ lib.mapAttrsToList wrapper sandboxed;
       systemd.user.sockets = lib.listToAttrs (map
@@ -495,7 +631,6 @@ in
         };
         Service = {
           ExecStart = lib.getExe cfg.matrix.package;
-          EnvironmentFile = cfg.matrix.environmentFile;
           Environment = lib.mapAttrsToList env ({
             PATH = lib.makeBinPath ([ cfg.package ]
               ++ lib.optionals transcribes [ pkgs.ffmpeg-headless pkgs.whisper-cpp ]);
@@ -504,8 +639,9 @@ in
             HERDR_MATRIX_OWNER = cfg.matrix.owner;
             HERDR_MATRIX_NAME = cfg.matrix.displayName;
             HERDR_MATRIX_AVATAR = "${cfg.matrix.avatar}";
-            HERDR_MATRIX_SPAWN_AVATAR = "${cfg.matrix.spawnAvatar}";
-            HERDR_MATRIX_SPAWN_PREFIX = lib.boolToString cfg.matrix.spawnPrefix;
+            HERDR_MATRIX_SPAWN_AVATAR = "${cfg.matrix.ownChat.avatar}";
+            HERDR_MATRIX_SPAWN_PREFIX = lib.boolToString cfg.matrix.ownChat.prefix;
+            HERDR_MATRIX_WORKSPACE = cfg.matrix.workspace;
           }
           // lib.optionalAttrs transcribes {
             HERDR_MATRIX_WHISPER_MODEL = modelPath cfg.matrix.transcribe.model;
@@ -516,6 +652,12 @@ in
           });
           Restart = "on-failure";
           RestartSec = 10;
+        }
+        // lib.optionalAttrs (cfg.matrix.environmentFile != null) {
+          EnvironmentFile = cfg.matrix.environmentFile;
+        }
+        // lib.optionalAttrs (cfg.matrix.tokenFile != null) {
+          LoadCredential = "token:${lib.replaceStrings [ "%" ] [ "%%" ] cfg.matrix.tokenFile}";
         };
         Install.WantedBy = [ "default.target" ];
       };

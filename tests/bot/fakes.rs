@@ -52,6 +52,8 @@ pub fn c(words: &[&str]) -> Vec<String> {
     words.iter().map(|w| (*w).to_owned()).collect()
 }
 
+pub type Hook = Box<dyn Fn(&[&str])>;
+
 #[derive(Default)]
 pub struct HerdrState {
     pub agents: IndexMap<String, String>,
@@ -66,6 +68,8 @@ pub struct HerdrState {
     pub labels: HashMap<String, String>,
     /// Pane → the kind of its agent, when not Claude, which herdr knows no session of
     pub kinds: HashMap<String, String>,
+    /// Runs before each call, with its words
+    pub hook: Option<Hook>,
 }
 
 #[derive(Clone, Default)]
@@ -121,6 +125,9 @@ impl Herdr for FakeHerdr {
     fn run(&mut self, args: &[&str]) -> Result<(i32, String)> {
         let mut s = self.0.borrow_mut();
         s.calls.push(c(args));
+        if let Some(hook) = &s.hook {
+            hook(args);
+        }
         let verb = (args[0], args.get(1).copied().unwrap_or_default());
         if verb == ("agent", "list") && s.fail > 0 {
             s.fail -= 1;
@@ -668,6 +675,7 @@ impl T {
         let mut extra = extra.clone();
         extra["msgtype"] = json!("m.audio");
         extra["url"] = json!("mxc://x/v");
+        extra["org.matrix.msc3245.voice"] = json!({});
         self.tell_with("Voice message.ogg", &extra);
     }
 

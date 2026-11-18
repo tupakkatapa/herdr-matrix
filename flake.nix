@@ -79,14 +79,19 @@
           checks =
             let
               inherit (pkgs) lib;
-              # The parts of Home Manager and of `programs.herdr` the module reads
-              home = { config, ... }: {
+              # The parts of `programs.herdr` the module reads
+              herdr = {
                 options = {
                   programs.herdr.enable = lib.mkEnableOption "herdr";
                   programs.herdr.package = lib.mkOption {
                     type = lib.types.package;
                     default = pkgs.emptyDirectory;
                   };
+                };
+              };
+              # The parts of Home Manager the module reads
+              home = { config, ... }: {
+                options = {
                   home.username = lib.mkOption {
                     type = lib.types.str;
                     default = "u";
@@ -127,11 +132,15 @@
                     type = lib.types.listOf lib.types.anything;
                     default = [ ];
                   };
+                  warnings = lib.mkOption {
+                    type = lib.types.listOf lib.types.str;
+                    default = [ ];
+                  };
                 };
               };
               evalWith = args: config:
                 (lib.evalModules {
-                  modules = [ self.homeModules.default home config ];
+                  modules = [ self.homeModules.default home herdr config ];
                   specialArgs = { inherit pkgs; } // args;
                 }).config;
               eval = evalWith { };
@@ -167,6 +176,7 @@
                     modules = [
                       self.homeModules.default
                       home
+                      herdr
                       ({ name, ... }: {
                         home.username = lib.mkDefault name;
                         home.homeDirectory = lib.mkDefault "/home/${name}";
@@ -224,10 +234,33 @@
                   };
                 };
               };
+              # The agents of `agents` with `displayName` for the old `name`, and
+              # with both, where `displayName` wins
+              renamed = name: eval {
+                programs.herdr = {
+                  enable = true;
+                  matrix = matrix // {
+                    package = echo;
+                    agents = {
+                      kate = {
+                        cwd = "/w/a b";
+                        displayName = "Kate";
+                        prefix = false;
+                        avatar = "/k.png";
+                        prompts.wake = { text = "it's 100% $HOME \"q\""; onCalendar = "hourly"; };
+                        prompts.mail = { text = "mail"; onCalendar = "*:0/15"; };
+                      } // lib.optionalAttrs (name != null) { inherit name; };
+                      quiet.cwd = "/w/q";
+                    };
+                  };
+                };
+              };
               service = config: config.systemd.user.services.herdr-matrix;
               agentsFile = config: lib.findFirst (lib.hasPrefix "\"HERDR_MATRIX_AGENTS=") null (service config).Service.Environment;
               path = config: lib.findFirst (lib.hasPrefix "\"PATH=") "" (service config).Service.Environment;
               pass = name: assertion: assert assertion; pkgs.runCommand name { } "touch $out";
+              fails = message: config: lib.elem { assertion = false; inherit message; } config.assertions;
+              ok = config: lib.all (a: a.assertion) config.assertions;
             in
             {
               # Known advisories (RustSec) against Cargo.lock, offline: the
@@ -250,23 +283,60 @@
                     }).options.programs.herdr.matrix;
                 }).optionsJSON;
               # The unit: `"`, `\\` and `%` escaped for systemd, tools on PATH and
-              # the model service only with a model; the command on the user's PATH
-              module-config = pass "herdr-matrix-module-config" (
-                lib.elem "\"HERDR_MATRIX_HOMESERVER=https://m.example.org/a%%b\\\"c\""
-                  (service bare).Service.Environment
-                && lib.elem "\"HERDR_MATRIX_SPAWN_PREFIX=true\"" (service bare).Service.Environment
-                && (service bare).Unit.Wants == [ ]
-                && !(bare.systemd.user.services ? herdr-matrix-models)
-                && !(lib.hasInfix "whisper" (path bare))
-                && (service hears).Unit.Wants == [ "herdr-matrix-models.service" ]
-                && lib.hasInfix "whisper-cpp" (path hears)
-                && lib.hasInfix "ffmpeg" (path hears)
-                && agents.home.packages == [ echo ]
-              );
+              # the model service only with a model; the command on the user's PATH;
+              # the token from either file; the old names of `ownChat` with a warning
+              module-config =
+                let
+                  withSettings = settings: eval { programs.herdr = { enable = true; matrix = matrix // settings; }; };
+                  tokened = eval {
+                    programs.herdr = {
+                      enable = true;
+                      matrix = removeAttrs matrix [ "environmentFile" ] // { tokenFile = "/run/tok%en"; workspace = "/w/%x"; };
+                    };
+                  };
+                  own = withSettings { ownChat = { avatar = "/o.png"; prefix = false; }; };
+                  spawn = withSettings { spawnAvatar = "/o.png"; spawnPrefix = false; };
+                  renamedTo = option: lib.any (lib.hasInfix "has been renamed to `programs.herdr.matrix.ownChat.${option}'") spawn.warnings;
+                in
+                pass "herdr-matrix-module-config" (
+                  lib.elem "\"HERDR_MATRIX_HOMESERVER=https://m.example.org/a%%b\\\"c\""
+                    (service bare).Service.Environment
+                  && lib.elem "\"HERDR_MATRIX_SPAWN_PREFIX=true\"" (service bare).Service.Environment
+                  && lib.elem "\"HERDR_MATRIX_WORKSPACE=/home/u/Workspace\"" (service bare).Service.Environment
+                  && (service bare).Service.EnvironmentFile == "/run/env"
+                  && !((service bare).Service ? LoadCredential)
+                  && (service tokened).Service.LoadCredential == "token:/run/tok%%en"
+                  && !((service tokened).Service ? EnvironmentFile)
+                  && lib.elem "\"HERDR_MATRIX_WORKSPACE=/w/%%x\"" (service tokened).Service.Environment
+                  && lib.elem "\"HERDR_MATRIX_SPAWN_AVATAR=/o.png\"" (service own).Service.Environment
+                  && lib.elem "\"HERDR_MATRIX_SPAWN_PREFIX=false\"" (service own).Service.Environment
+                  && own.warnings == [ ]
+                  && service spawn == service own
+                  && lib.length spawn.warnings == 2
+                  && renamedTo "avatar"
+                  && renamedTo "prefix"
+                  && (service bare).Unit.Wants == [ ]
+                  && !(bare.systemd.user.services ? herdr-matrix-models)
+                  && !(lib.hasInfix "whisper" (path bare))
+                  && (service hears).Unit.Wants == [ "herdr-matrix-models.service" ]
+                  && lib.hasInfix "whisper-cpp" (path hears)
+                  && lib.hasInfix "ffmpeg" (path hears)
+                  && agents.home.packages == [ echo ]
+                );
               # Per-agent settings: none, no file and no prompt units; else the
-              # file, and a service and timer per prompt that pass its text whole
+              # file, and a service and timer per prompt that pass its text whole.
+              # The old `name` gives the file of `displayName`, with a warning.
               module-agents =
                 let
+                  named = renamed null;
+                  both = renamed "Old";
+                  warned = value: [ "programs.herdr.matrix.agents.kate.name = \"${value}\": the option is named displayName. Set programs.herdr.matrix.agents.kate.displayName." ];
+                  started = eval {
+                    programs.herdr = {
+                      enable = true;
+                      matrix = matrix // { agents.sam = { cwd = "/w/s"; displayName = "Sam"; chat = true; autostart = true; }; };
+                    };
+                  };
                   units = agents.systemd.user.services;
                   timers = agents.systemd.user.timers;
                   names = [ "herdr-matrix-prompt-kate-mail" "herdr-matrix-prompt-kate-wake" ];
@@ -274,6 +344,11 @@
                   wake = pkgs.writeText "wake" "prompt\n--cwd\n/w/a b\nit's 100% $HOME \"q\"\n";
                 in
                 assert agentsFile bare == null
+                && agentsFile named == agentsFile agents
+                && agentsFile both == agentsFile agents
+                && named.warnings == [ ]
+                && agents.warnings == warned "Kate"
+                && both.warnings == warned "Old"
                 && lib.attrNames bare.systemd.user.services == [ "herdr-matrix" ]
                 && bare.systemd.user.timers == { }
                 && lib.attrNames units == [ "herdr-matrix" ] ++ names
@@ -297,16 +372,56 @@
                     {"cwd": "/w/a b", "name": "Kate", "prefix": false, "avatar": "/k.png"},
                     {"cwd": "/w/q", "name": null, "prefix": null, "avatar": null}
                   ]' ${file}
+                  jq -e '. == [
+                    {"cwd": "/w/s", "name": "Sam", "prefix": null, "avatar": null, "chat": true, "autostart": true}
+                  ]' ${lib.removeSuffix "\"" (lib.removePrefix "\"HERDR_MATRIX_AGENTS=" (agentsFile started))}
                   touch $out
                 '';
-              module-assertion = pass "herdr-matrix-module-assertion" (
-                lib.elem
-                  {
-                    assertion = false;
-                    message = "programs.herdr.matrix.enable needs programs.herdr.enable.";
-                  }
-                  (eval { programs.herdr.matrix = matrix; }).assertions
-              );
+              # Settings that cannot work fail evaluation with the option, its value and
+              # the fix; settings the bot applies in part give a warning
+              module-assertion =
+                let
+                  withSettings = settings: eval { programs.herdr = { enable = true; matrix = matrix // settings; }; };
+                  withAgents = agents: withSettings { inherit agents; };
+                  # Without a module that defines `programs.herdr.enable`
+                  alone = (lib.evalModules {
+                    modules = [ self.homeModules.default home { programs.herdr.matrix = matrix; } ];
+                    specialArgs = { inherit pkgs; };
+                  }).config;
+                  homeserver = url: withSettings { homeserver = url; };
+                  badHomeserver = url: fails "programs.herdr.matrix.homeserver = ${builtins.toJSON url}: the bot sends its token with each request, so the URL must be https://, or http:// to localhost, 127.0.0.1 or [::1]. Use the https:// URL of the homeserver."
+                    (homeserver url);
+                  badOwner = owner: fails "programs.herdr.matrix.owner = ${builtins.toJSON owner}: a Matrix user id has the form @local:server. Use the full id, such as \"@alice:example.org\"."
+                    (withSettings { inherit owner; });
+                  prompted = id: withAgents { ${id} = { cwd = "/w/a"; prompts.wake = { text = "wake"; onCalendar = "hourly"; }; }; };
+                  shared = withAgents { a.cwd = "/w/x"; b.cwd = "/w/x/"; c.cwd = "/w/x"; d.cwd = "/w/x/y"; };
+                in
+                pass "herdr-matrix-module-assertion" (
+                  fails "programs.herdr.enable = false: programs.herdr.matrix needs herdr. Set programs.herdr.enable = true."
+                    (eval { programs.herdr.matrix = matrix; })
+                  && fails "programs.herdr.matrix needs a module that defines programs.herdr.enable and programs.herdr.package." alone
+                  && ok bare
+                  && lib.all badHomeserver [ "http://m.example.org" "http://localhost.example.org" "http://127.0.0.1.example.org" "http://[::2]" "ftp://localhost" "m.example.org" "" ]
+                  && lib.all (url: ok (homeserver url)) [ "https://m.example.org" "http://localhost" "http://localhost:8008/x" "http://127.0.0.1:8008" "http://127.1.2.3" "http://[::1]:8008" "http://[0:0:0:0:0:0:0:1]/" ]
+                  && lib.all badOwner [ "alice" "@alice" "alice:example.org" "@:example.org" ]
+                  && fails "programs.herdr.matrix.agents.nora.cwd = \"Workspace/nora\": the folder must be an absolute path, as herdr reports it. Use a path such as \"\${config.home.homeDirectory}/Workspace/nora\"."
+                    (withAgents { nora.cwd = "Workspace/nora"; })
+                  && shared.warnings == [ "programs.herdr.matrix.agents.a.cwd = \"/w/x\": the agents a, b and c work in the same folder, and the bot applies the settings of one agent per folder. Give each agent its own cwd." ]
+                  && ok shared
+                  && ok (withAgents { a.cwd = "/w/x"; b.cwd = "/w/x/y"; c.cwd = "/w/xy"; })
+                  && (withAgents { a.cwd = "/w/x"; b.cwd = "/w/x/y"; c.cwd = "/w/xy"; }).warnings == [ ]
+                  && fails "programs.herdr.matrix.tokenFile = null: the bot needs its as_token from tokenFile or environmentFile. Set programs.herdr.matrix.tokenFile."
+                    (eval { programs.herdr = { enable = true; matrix = removeAttrs matrix [ "environmentFile" ]; }; })
+                  && fails "programs.herdr.matrix.tokenFile = \"/run/tok\": programs.herdr.matrix.environmentFile is set too, and the bot takes its as_token from one file. Remove one of them."
+                    (withSettings { tokenFile = "/run/tok"; })
+                  && ok (eval { programs.herdr = { enable = true; matrix = removeAttrs matrix [ "environmentFile" ] // { tokenFile = "/run/tok"; }; }; })
+                  && fails "programs.herdr.matrix.agents.\"a b\": the attribute name of an agent with prompts goes into systemd unit names, so it takes only letters, digits, `-`, `_`, `.`, `:`, `@` and `\\`. Rename it, such as \"a-b\"."
+                    (prompted "a b")
+                  && fails "programs.herdr.matrix.agents.a.prompts.\"x/y\": the name of a prompt goes into systemd unit names, so it takes only letters, digits, `-`, `_`, `.`, `:`, `@` and `\\`. Rename it, such as \"x-y\"."
+                    (withAgents { a = { cwd = "/w/a"; prompts."x/y" = { text = "t"; onCalendar = "hourly"; }; }; })
+                  && lib.all (id: ok (prompted id)) [ "a.b" "a_b-c" "a:b" "a@b" ]
+                  && ok (withAgents { "a b".cwd = "/w/a"; })
+                );
               # A confined agent: its command on the user's PATH, its places in the
               # agents file, and bwrap with only what it is granted; an agent without
               # a sandbox stays as it is, and a bad sandbox fails evaluation
@@ -341,18 +456,14 @@
                     }
                     { kind = "pi"; };
                   port = "herdr-matrix-port-nora-11434";
-                  badFile = key: fails "nora" "sandbox.files.\"${key}\" must be a path in the state directory, without an empty, `.` or `..` part."
+                  at = "programs.herdr.matrix.agents.nora";
+                  badFile = key: fails "${at}.sandbox.files.${lib.strings.escapeNixIdentifier key}: the key must be a path in the state directory, without an empty, `.` or `..` part. Use a relative path, such as \"models.json\"."
                     (nora { enable = true; files.${key} = "/m.json"; } { });
-                  badPort = key: fails "nora" "sandbox.allow.ports.\"${key}\": the port inside must be a number from 1024 to 65535."
+                  badPort = key: fails "${at}.sandbox.allow.ports.${lib.strings.escapeNixIdentifier key}: the key is the port inside the sandbox, a number from 1024 to 65535. Use a port in that range."
                     (nora { enable = true; allow = { network = false; ports.${key} = "h:1"; }; } { });
-                  badAddress = address: fails "nora" "sandbox.allow.ports.\"2000\": the address outside must be `host:port`."
+                  badAddress = address: fails "${at}.sandbox.allow.ports.\"2000\" = ${builtins.toJSON address}: the address outside must be `host:port`. Write it as host:port, such as \"10.23.0.18:11444\" or \"[::1]:80\"."
                     (nora { enable = true; allow = { network = false; ports."2000" = address; }; } { });
-                  fails = id: message: config: lib.elem
-                    {
-                      assertion = false;
-                      message = "programs.herdr.matrix.agents.${id}: ${message}";
-                    }
-                    config.assertions;
+                  unconfined = set: fails "${at}: ${set}, but sandbox.enable is false. Set sandbox.enable = true, or remove ${if lib.hasSuffix "are set" set then "them" else "it"}.";
                   inHome = cwd: confined { } { nora = { inherit cwd; sandbox.enable = true; }; };
                   wrapper = config: "${lib.findFirst (p: p.name == "herdr-matrix-agent-nora") null config.home.packages}/bin/herdr-matrix-agent-nora";
                   file = config: lib.removeSuffix "\"" (lib.removePrefix "\"HERDR_MATRIX_AGENTS=" (agentsFile config));
@@ -364,33 +475,45 @@
                   };
                   piState = "/home/u/.local/state/herdr-matrix/agents/nora/pi";
                 in
-                assert lib.all (a: a.assertion) full.assertions
-                && lib.all (a: a.assertion) bare.assertions
+                assert ok full
+                && ok bare
                 && map lib.getName full.home.packages == [ "herdr-matrix" "herdr-matrix-agent-nora" ]
-                && fails "nora" "the sandbox options need sandbox.enable." (nora { allow.sendFiles = false; } { })
-                && fails "nora" "the sandbox options need sandbox.enable." (nora { program = [ "x" ]; } { })
-                && fails "nora" "the sandbox options need sandbox.enable." (nora { program = [ "claude" ]; } { kind = "pi"; })
-                && lib.all (a: a.assertion) (nora { program = [ "pi" ]; } { kind = "pi"; }).assertions
-                && lib.all (a: a.assertion) pi.assertions
-                && fails "nora" "sandbox.allow.chats needs programs.herdr.matrix.gate.enable." (confined { } {
+                && unconfined "sandbox.allow.sendFiles is set" (nora { allow.sendFiles = false; } { })
+                && unconfined "sandbox.program is set" (nora { program = [ "x" ]; } { })
+                && unconfined "sandbox.program is set" (nora { program = [ "claude" ]; } { kind = "pi"; })
+                && unconfined "sandbox.program, sandbox.allow.network and sandbox.allow.chats.rooms are set"
+                  (nora { program = [ "x" ]; allow = { network = false; chats.rooms = [ "!a:x" ]; }; } { })
+                && ok (nora { program = [ "pi" ]; } { kind = "pi"; })
+                && ok pi
+                && fails "${at}.sandbox.allow.chats.read = true: the agent's chats go through the chat gate. Set programs.herdr.matrix.gate.enable = true." (confined { } {
                   nora = { cwd = "/w/n"; sandbox = { enable = true; allow.chats.read = true; }; };
                 })
-                && fails "nora" "sandbox.allow.chats.rooms needs sandbox.allow.chats.read or send." (nora { enable = true; allow.chats.rooms = [ "!a:x" ]; } { })
-                && fails "no.ra" "the name of a confined agent takes only letters, digits, `_` and `-`." (confined { } {
+                && fails "${at}.sandbox.allow.chats.send = true: the agent's chats go through the chat gate. Set programs.herdr.matrix.gate.enable = true." (confined { } {
+                  nora = { cwd = "/w/n"; sandbox = { enable = true; allow.chats.send = true; }; };
+                })
+                && fails "${at}.sandbox.allow.chats.rooms = [ \"!a:x\" ]: the rooms limit sandbox.allow.chats.read and send, and neither is on. Set sandbox.allow.chats.read or sandbox.allow.chats.send to true, or remove the rooms."
+                  (nora { enable = true; allow.chats.rooms = [ "!a:x" ]; } { })
+                && fails "programs.herdr.matrix.agents.\"no.ra\": the attribute name of a confined agent names its command, directories and socket, so it takes only letters, digits, `_` and `-`. Rename it, such as \"no-ra\"." (confined { } {
                   "no.ra" = { cwd = "/w/n"; sandbox.enable = true; };
                 })
-                && lib.all (cwd: fails "nora" "the cwd of a confined agent must not hold the home directory." (inHome cwd)) [ "/home/u" "/home/u/" "/home" "/" ]
-                && lib.all (a: a.assertion) (inHome "/home/u/w").assertions
-                && lib.all (a: a.assertion) (inHome "/home/uw").assertions
-                && lib.all (a: a.assertion) ported.assertions
-                && fails "nora" "the sandbox options need sandbox.enable." (nora { files."m" = "/m"; } { })
-                && fails "nora" "the sandbox options need sandbox.enable." (nora { allow = { network = false; ports."2000" = "h:1"; }; } { })
-                && fails "nora" "sandbox.allow.ports needs sandbox.allow.network = false." (nora { enable = true; allow.ports."2000" = "h:1"; } { })
+                && lib.all (cwd: fails "${at}.cwd = ${builtins.toJSON cwd}: the folder of a confined agent must not hold the home directory. Use a folder inside it, such as \"/home/u/Workspace/nora\"." (inHome cwd)) [ "/home/u" "/home/u/" "/home" "/" "/home//u" ]
+                && lib.all (cwd: fails "${at}.cwd = ${builtins.toJSON cwd}: the folder of a confined agent must not hold a `.` or `..` part. Write the path without them." (inHome cwd)) [ "/home/u/." "/home/u/x/.." "/home/u/./x" ]
+                && ok (inHome "/home/u/w")
+                && ok (inHome "/home/u/x/")
+                && ok (inHome "/home/uw")
+                && ok ported
+                && unconfined "sandbox.files is set" (nora { files."m" = "/m"; } { })
+                && unconfined "sandbox.allow.network and sandbox.allow.ports are set" (nora { allow = { network = false; ports."2000" = "h:1"; }; } { })
+                && fails "${at}.sandbox.allow.network = true: sandbox.allow.ports is the way to reach a service without the network, so it needs the network off. Set sandbox.allow.network = false, or remove sandbox.allow.ports."
+                  (nora { enable = true; allow.ports."2000" = "h:1"; } { })
                 && lib.all badFile [ "/abs" "../x" "a/../b" "a/" "a//b" "." "" ]
-                && lib.all (a: a.assertion) (nora { enable = true; files."a/.b/c" = "/m"; } { }).assertions
+                && ok (nora { enable = true; files."a/.b/c" = "/m"; } { })
                 && lib.all badPort [ "80" "1023" "65536" "01024" "0x400" "" "999999999999999999999" ]
                 && lib.all badAddress [ "h" ":1" "h:" "h:p" "a b:1" "h:1 x" "::1:80" "h:1%2" ]
-                && lib.all (a: a.assertion) (nora { enable = true; allow = { network = false; ports = { "1024" = "my-host.lan:1"; "65535" = "10.0.0.1:65535"; }; }; } { }).assertions
+                && ok (nora { enable = true; allow = { network = false; ports = { "1024" = "my-host.lan:1"; "65535" = "10.0.0.1:65535"; }; }; } { })
+                && bare.warnings == [ "${at}.sandbox.allow.network = false: the agent has no network and no sandbox.allow.ports, so it cannot reach a model. Name the model's address in sandbox.allow.ports, or set sandbox.allow.network = true." ]
+                && ported.warnings == [ ]
+                && plain.warnings == [ ]
                 && plain.systemd.user.sockets == { }
                 && lib.attrNames ported.systemd.user.sockets == [ port "herdr-matrix-port-nora-2000" ]
                 && ported.systemd.user.sockets.${port} == {
@@ -504,20 +627,16 @@
               # The gate needs the bot and the NixOS module, and leaves the bot's units alone
               module-gate =
                 let
-                  needsOs = config: lib.any (a: !a.assertion && lib.hasInfix "nixosModules.default" a.message) config.assertions;
+                  needsOs = fails "programs.herdr.matrix.gate.enable = true: the gate runs as a system service, which only the NixOS module makes; standalone Home Manager cannot run it. Import herdr-matrix.nixosModules.default in the NixOS configuration, and run Home Manager as its NixOS module.";
                 in
                 pass "herdr-matrix-module-gate" (
                   needsOs (gated { })
                   && needsOs (gated { osConfig = null; })
                   && needsOs (gated { osConfig = { }; })
-                  && lib.all (a: a.assertion) (gated { osConfig = os; }).assertions
+                  && ok (gated { osConfig = os; })
                   && (gated { osConfig = os; }).systemd.user == bare.systemd.user
-                  && lib.elem
-                    {
-                      assertion = false;
-                      message = "programs.herdr.matrix.gate.enable needs programs.herdr.matrix.enable.";
-                    }
-                    (evalWith { osConfig = os; } { programs.herdr.matrix.gate = gate; }).assertions
+                  && fails "programs.herdr.matrix.enable = false: programs.herdr.matrix.gate.enable needs the chat. Set programs.herdr.matrix.enable = true."
+                    (evalWith { osConfig = os; } { programs.herdr.matrix.gate = gate; })
                 );
               # Without a user with the gate on, the system holds no gate unit, user or group
               gate-module =

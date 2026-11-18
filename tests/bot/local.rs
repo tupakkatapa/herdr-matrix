@@ -328,3 +328,90 @@ fn local_prompt_by_shared_cwd_is_dropped() {
     );
     assert!(t.bot.state().pending.is_empty());
 }
+
+#[test]
+fn local_prompt_waits_out_a_herdr_failure() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    local(&t, "repo-wA", "wake", t.now());
+    t.herdr.0.borrow_mut().fail = 1;
+    assert!(t.bot.local().is_err());
+    t.bot.local().expect("local");
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![c(&["agent", "prompt", "wA:p1", "wake"])]
+    );
+}
+
+#[test]
+fn empty_queues_ask_herdr_nothing() {
+    let mut t = T::new();
+    t.herdr.0.borrow_mut().calls.clear();
+    t.bot.local().expect("local");
+    assert!(t.herdr.calls().is_empty(), "{:?}", t.herdr.calls());
+}
+
+#[test]
+fn failed_save_after_a_local_prompt_is_logged_once() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.poll();
+    let mut tmp = t.state_path().into_os_string();
+    tmp.push(".tmp");
+    let blocked = tmp.clone();
+    t.herdr.0.borrow_mut().hook = Some(Box::new(move |args| {
+        if args[1] == "prompt" {
+            fs::create_dir(&blocked).expect("mkdir");
+        }
+    }));
+    local(&t, "repo-wA", "wake", t.now());
+    t.clear_log();
+    t.bot.local().expect("local");
+    fs::remove_dir(&tmp).expect("rmdir");
+    assert_eq!(t.herdr.did("prompt").len(), 1);
+    let errors = t
+        .log_lines()
+        .into_iter()
+        .filter(|l| l.starts_with("error: "))
+        .count();
+    assert_eq!(errors, 1, "{:?}", t.log_lines());
+}
+
+#[test]
+fn local_prompt_survives_a_failed_send() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    local(&t, "repo-wA", "wake", t.now());
+    t.herdr
+        .0
+        .borrow_mut()
+        .broken
+        .insert(("agent".into(), "prompt".into()));
+    t.bot.local().expect("local");
+    t.herdr.0.borrow_mut().broken.clear();
+    t.bot.local().expect("local");
+    assert_eq!(
+        t.herdr.did("prompt"),
+        vec![c(&["agent", "prompt", "wA:p1", "wake"]); 2]
+    );
+    t.bot.local().expect("local");
+    assert_eq!(t.herdr.did("prompt").len(), 2);
+}
+
+#[test]
+fn local_turn_without_text_posts_nothing() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.said("wA:p1", &[("u1", "old")], None);
+    t.poll();
+    let before = t.new_msgs().len();
+    local(&t, "repo-wA", "nightly", t.now());
+    t.bot.local().expect("local");
+    t.set("wA:p1", "working");
+    t.poll();
+    t.set("wA:p1", "idle");
+    t.poll();
+    t.poll();
+    assert_eq!(t.new_msgs().len(), before, "{:?}", t.new_msgs());
+    assert!(t.bot.state().pending.is_empty());
+}

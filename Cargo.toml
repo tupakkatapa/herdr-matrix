@@ -8,6 +8,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 anyhow = "1"
 indexmap = { version = "2", features = ["serde"] }
+libc = "0.2.191"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

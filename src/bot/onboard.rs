@@ -4,9 +4,10 @@
 use std::fs;
 use std::io::Cursor;
 
+use super::contacts::Why;
 use super::{Bot, To};
 use crate::Result;
-use crate::commands::{HELP, Place, helps};
+use crate::commands::{Place, helps};
 use crate::matrix::{Api as _, As, Sync, private_room};
 use crate::state::sha256_hex;
 
@@ -17,6 +18,14 @@ impl Bot {
     /// When Matrix or herdr fails.
     pub fn onboard(&mut self) -> Result<()> {
         if self.state.owner.as_deref() != Some(self.deps.owner.as_str()) {
+            let panes: Vec<String> = self.state.spawned.keys().cloned().collect();
+            for pane in panes {
+                self.end_chat(&pane, Why::Owner)?;
+            }
+            self.state.pending.clear();
+            self.state.asked.clear();
+            self.state.sent.clear();
+            self.state.left.clear();
             self.state.owner = Some(self.deps.owner.clone());
             self.state.control = None;
             self.state.attached = None;
@@ -28,17 +37,32 @@ impl Bot {
         self.welcome(&room)
     }
 
+    /// The commands, what the chat is, and the first thing to do.
     fn welcome(&mut self, room: &str) -> Result<()> {
         self.state.control = Some(room.to_owned());
+        self.nicked = false;
         self.save()?;
-        self.say(HELP, To::default().screen(&helps(Place::Main)))?;
-        let agents = self.agents()?;
-        let head = if self.away() {
-            "Away is on. Agents:"
-        } else {
-            "Agents:"
+        let agents = self.agents().unwrap_or_else(|err| {
+            self.log(&format!("error: welcome: {err}"));
+            Vec::new()
+        });
+        let action = match (self.attached(&agents), agents.len()) {
+            (Some(a), _) => format!("Write here to talk to **{}**.", a.name),
+            (None, 0) => {
+                "No agent is running. Start one with !new <folder>; !new lists the folders.".into()
+            }
+            (None, _) => "!attach one of them to start.".into(),
         };
-        self.ask_which(head, &agents)
+        let text = format!(
+            "{}\n\nThis chat reaches the coding agents on this machine: what you write goes \
+             to the attached one, and its answers come back here.\n!help explains the rest.\n{action}",
+            helps(Place::Main)
+        );
+        if self.attached(&agents).is_none() && !agents.is_empty() {
+            return self.ask_which(&text, &agents);
+        }
+        self.say(&text, To::default())?;
+        Ok(())
     }
 
     /// A room the owner invites the bot to becomes the chat, like a
@@ -110,6 +134,7 @@ impl Bot {
         let me = self.me()?;
         self.matrix
             .set_displayname(&me, As::Bot, self.deps.name.as_deref())?;
+        self.nicked = false;
         let url = self.picture(&data)?;
         self.matrix.set_avatar(&me, As::Bot, &url)?;
         self.state.profile = Some(want);
@@ -130,15 +155,18 @@ impl Bot {
         Ok(url)
     }
 
-    /// Names the chat after the attached agent: the bot's name in this
-    /// room only.
+    /// Names the chat after the attached agent, and away while it is on:
+    /// the bot's name in this room only.
     pub(super) fn nick(&mut self, agent: Option<&str>) -> Result<()> {
         let Some(name) = self.deps.name.clone() else {
             return Ok(());
         };
         let (room, _) = self.room(None)?;
         let me = self.me()?;
-        let shown = agent.map_or(name.clone(), |a| format!("{name} · {a}"));
+        let mut shown = agent.map_or(name.clone(), |a| format!("{name} · {a}"));
+        if self.away() {
+            shown.push_str(" · away");
+        }
         self.matrix.set_room_name(&room, &me, &shown)
     }
 }

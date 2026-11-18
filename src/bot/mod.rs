@@ -8,7 +8,7 @@ mod inbound;
 mod onboard;
 mod poll;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,11 +18,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::herdr::{self, Agent, Herdr, RunHerdr, Status, Turn};
-use crate::kind::{self, Kind};
+use crate::kind::{self, Kind, pi};
 use crate::matrix::{Api as _, As, Matrix};
-use crate::render::{EVENT_MAX, chunks, cut, escape, md, screen_size, size};
+use crate::render::{EVENT_MAX, chunks, cut, escape, md, plain, screen_size, size};
 use crate::state::{Away, Chat, State, Store};
-use crate::{Error, Result};
+use crate::{Error, Result, files};
 
 /// Marks a prompt from the chat, so the agent answers for a phone
 pub const MARK: &str = "[Element]";
@@ -39,6 +39,8 @@ pub const SENT_MAX: usize = 200;
 /// Transaction ids kept for messages not yet out whole
 const TXNS_KEPT: usize = 100;
 pub const POLL_EVERY: Duration = Duration::from_secs(3);
+/// The long poll while a turn is under way, when herdr is polled each tick
+const SYNC_TURN: Duration = Duration::from_millis(500);
 /// How long the newest message of a turn is held back
 pub const HOLD: Duration = Duration::from_secs(20);
 /// Messages older than this when they arrive are skipped
@@ -47,6 +49,16 @@ pub const STALE: Duration = Duration::from_mins(10);
 pub const PENDING_TTL: Duration = Duration::from_mins(10);
 /// How long files from the chat wait for more for the same agent
 pub const FILES_WAIT: Duration = Duration::from_secs(5);
+/// The wait after a step first fails; it doubles with each next failure
+const RETRY_FIRST: Duration = Duration::from_secs(3);
+const RETRY_MAX: Duration = Duration::from_hours(1);
+/// The longest wait between two polls while herdr fails
+const POLL_MAX: Duration = Duration::from_mins(1);
+const PURGE_EVERY: Duration = Duration::from_hours(1);
+/// How long the bot keeps what waits on the owner's next step or on an
+/// agent that starts: an `!exit` to confirm, a message with no agent, a
+/// pane started with `!new`
+const FOLLOW_UP: Duration = Duration::from_mins(2);
 
 /// What a recording says
 pub type Transcribe = Box<dyn Fn(&Path) -> Result<String>>;
@@ -65,6 +77,10 @@ pub struct AgentSettings {
     pub prefix: Option<bool>,
     pub avatar: Option<PathBuf>,
     pub sandbox: Option<Sandbox>,
+    /// An own chat as soon as the bot sees the agent
+    pub chat: bool,
+    /// Started once when the bot comes up and it does not run
+    pub autostart: bool,
 }
 
 /// The places of a confined agent, which `herdr-matrix-agent-<id>` binds
@@ -184,6 +200,25 @@ impl<'a> To<'a> {
     }
 }
 
+/// A step that failed: how often in a row, when last, and what it said.
+#[derive(Default)]
+struct Retry {
+    failures: u32,
+    at: f64,
+    said: String,
+}
+
+/// A pane the bot started that is not ready yet.
+struct Starting {
+    folder: String,
+    /// When it started, or last waited on a choice
+    at: f64,
+    /// True once herdr listed it
+    seen: bool,
+    /// Polls and since when herdr no longer lists it
+    missing: Option<(u32, f64)>,
+}
+
 /// How an agent's message is posted: its text, else its screen; quiet as a
 /// notice; with how to answer it when another agent is attached.
 #[derive(Clone, Copy)]
@@ -247,7 +282,8 @@ pub struct Bot {
     missing: IndexMap<String, (u32, f64)>,
     /// Agents a failure kept out of the sweep when away began
     unswept: BTreeSet<String>,
-    typing: BTreeSet<Option<String>>,
+    /// The chats that show an agent typing: when the notice was sent
+    typing: BTreeMap<Option<String>, f64>,
     user_id: Option<String>,
     /// True once the name and picture are set
     profiled: bool,
@@ -257,6 +293,39 @@ pub struct Bot {
     digests: HashMap<PathBuf, String>,
     /// Files from the chat that wait for more
     held_files: Vec<inbound::Held>,
+    /// The agents herdr listed last
+    listed: Vec<Agent>,
+    /// Steps that failed, by what the journal calls them
+    retries: IndexMap<String, Retry>,
+    /// True once the main chat is named after the attached agent
+    nicked: bool,
+    /// When the old files were last removed
+    purged: Option<f64>,
+    /// Queued files the homeserver failed to take, by their copy: the last
+    /// error, and how often it failed
+    failed_uploads: IndexMap<PathBuf, (String, u32, f64)>,
+    /// The largest upload the homeserver takes, once it said; `u64::MAX`
+    /// when it names none
+    upload_limit: Option<u64>,
+    /// The pane `!exit` last asked to confirm, and when
+    exit_asked: Option<(String, f64)>,
+    /// The attached pane and its agent's name, as last listed
+    attached_name: Option<(String, String)>,
+    /// Polls and since when the attached pane is missing
+    attached_missing: Option<(u32, f64)>,
+    /// Panes `!new` started that are not ready yet
+    starting: IndexMap<String, Starting>,
+    /// Panes the bot started in this run for a configured agent: its `cwd`,
+    /// and polls and since when herdr no longer lists the pane
+    started_for: IndexMap<String, (String, Option<(u32, f64)>)>,
+    /// The last message that found no agent
+    kept: Option<inbound::Kept>,
+    /// The panes of the agents as the chat last listed them, by number
+    numbered: Vec<String>,
+    /// Lists of herdr in a row that did not fail
+    good_polls: u32,
+    /// The `cwd` of the agents the bot tried to start in this run
+    autostarted: BTreeSet<String>,
 }
 
 impl Bot {
@@ -266,19 +335,34 @@ impl Bot {
             matrix,
             deps,
             store,
-            state,
             statuses: None,
             reported: IndexMap::new(),
             last_poll: None,
-            was_afk: false,
+            was_afk: state.away == Away::On,
             missing: IndexMap::new(),
             unswept: BTreeSet::new(),
-            typing: BTreeSet::new(),
+            typing: BTreeMap::new(),
             user_id: None,
             profiled: false,
             txns: IndexMap::new(),
             digests: HashMap::new(),
             held_files: Vec::new(),
+            listed: Vec::new(),
+            retries: IndexMap::new(),
+            nicked: false,
+            purged: None,
+            failed_uploads: IndexMap::new(),
+            upload_limit: None,
+            exit_asked: None,
+            attached_name: None,
+            attached_missing: None,
+            starting: IndexMap::new(),
+            started_for: IndexMap::new(),
+            kept: None,
+            numbered: Vec::new(),
+            good_polls: 0,
+            autostarted: BTreeSet::new(),
+            state,
         }
     }
 
@@ -310,6 +394,16 @@ impl Bot {
         self.store.save(&self.state)
     }
 
+    /// Logs what the bot starts with.
+    pub fn log_start(&self) {
+        let away = if self.away() { "on" } else { "off" };
+        self.log(&format!(
+            "started: contacts {}, attached {}, away {away}",
+            self.state.spawned.len(),
+            self.state.attached.as_deref().unwrap_or("none"),
+        ));
+    }
+
     fn log(&self, line: &str) {
         (self.deps.log)(line);
     }
@@ -324,37 +418,57 @@ impl Bot {
     }
 
     fn agents(&mut self) -> Result<Vec<Agent>> {
-        herdr::list_agents(self.deps.herdr.as_mut())
+        let agents =
+            herdr::list_agents(self.deps.herdr.as_mut()).inspect_err(|_| self.good_polls = 0)?;
+        self.listed.clone_from(&agents);
+        Ok(agents)
     }
 
     fn read(&mut self, pane: &str, lines: u64) -> Result<String> {
         herdr::read(self.deps.herdr.as_mut(), pane, lines)
     }
 
-    /// The agent this chat talks to; the only one when there is one.
+    /// The agent this chat talks to: the attached one while it runs; the
+    /// only one when none is attached.
     fn attached<'a>(&self, agents: &'a [Agent]) -> Option<&'a Agent> {
-        agents
-            .iter()
-            .find(|a| Some(&a.pane_id) == self.state.attached.as_ref())
-            .or(if agents.len() == 1 {
-                agents.first()
-            } else {
-                None
-            })
+        match &self.state.attached {
+            Some(pane) => agents.iter().find(|a| &a.pane_id == pane),
+            None if agents.len() == 1 => agents.first(),
+            None => None,
+        }
+    }
+
+    /// The name of the attached agent, as last listed.
+    fn attached_name(&self) -> Option<&str> {
+        self.attached_name
+            .as_ref()
+            .filter(|(pane, _)| Some(pane) == self.state.attached.as_ref())
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// Attaches the chat to an agent.
+    fn attach_to(&mut self, a: &Agent) -> Result<()> {
+        self.state.attached = Some(a.pane_id.clone());
+        self.attached_name = Some((a.pane_id.clone(), a.name.clone()));
+        self.save()?;
+        self.nicked = self.retry("nick", RETRY_MAX, |bot| bot.nick(Some(&a.name)));
+        Ok(())
     }
 
     fn listing(&self, agents: &[Agent]) -> String {
         let here = self.attached(agents).map(|a| a.pane_id.clone());
         let lines: Vec<String> = agents
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(i, a)| {
                 format!(
-                    "{} {}  {}{}",
+                    "{} {}. {}  {}{}",
                     if Some(&a.pane_id) == here.as_ref() {
                         ">"
                     } else {
                         " "
                     },
+                    i + 1,
                     a.name,
                     doing(&a.status),
                     if self.state.spawned.contains_key(&a.pane_id) {
@@ -372,18 +486,41 @@ impl Bot {
         }
     }
 
-    /// The agent `query` names; else asks in the main chat which one, as
-    /// `which` says it ("Attach to which"), under the list of them.
+    /// The agent `query` names, or its number in the list last shown; with
+    /// no query, the agent in the pane `replied` to; else asks in the main
+    /// chat which one, as `which` says it ("Attach to which"), under the
+    /// list of them. A name that is a number wins over the number; a number
+    /// matches no other name.
     fn pick<'a>(
         &mut self,
         query: &str,
         agents: &'a [Agent],
         which: &str,
+        replied: Option<&str>,
     ) -> Result<Option<&'a Agent>> {
+        let number = !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit());
+        let pane = if query.is_empty() {
+            replied
+        } else if let Some(a) = agents.iter().find(|a| number && a.name == query) {
+            Some(a.pane_id.as_str())
+        } else {
+            query
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| self.numbered.get(n.wrapping_sub(1)))
+                .map(String::as_str)
+        };
+        if let Some(a) = pane.and_then(|p| agents.iter().find(|a| a.pane_id == p)) {
+            return Ok(Some(a));
+        }
+        if number {
+            self.ask_which(&format!("No agent {query} in the last list."), agents)?;
+            return Ok(None);
+        }
         let head = match herdr::find(agents, query) {
-            Ok(a) if !query.is_empty() => return Ok(Some(a)),
             _ if query.is_empty() => format!("{which} agent?"),
-            Err(0) | Ok(_) => format!("No agent matches \"{query}\". {which} one?"),
+            Ok(a) => return Ok(Some(a)),
+            Err(0) => format!("No agent matches \"{query}\". {which} one?"),
             Err(n) => format!("\"{query}\" matches {n} agents. {which} one?"),
         };
         self.ask_which(&head, agents)?;
@@ -393,6 +530,7 @@ impl Bot {
     /// Asks in the main chat which agent, under the list of them.
     fn ask_which(&mut self, head: &str, agents: &[Agent]) -> Result<()> {
         let listing = self.listing(agents);
+        self.numbered = agents.iter().map(|a| a.pane_id.clone()).collect();
         self.say(head, To::default().screen(&listing))?;
         Ok(())
     }
@@ -417,33 +555,103 @@ impl Bot {
 
     /// The name and picture until they are set, one sync, the files from
     /// the chat that no more joined, and a herdr poll when one is due, so a
-    /// homeserver that answers /sync at once does not spin herdr.
+    /// homeserver that answers /sync at once does not spin herdr. While a
+    /// turn is under way, each tick polls. While herdr fails, its polls come
+    /// further apart.
     ///
     /// # Errors
-    /// When Matrix or herdr fails.
+    /// When Matrix fails.
     pub fn tick(&mut self) -> Result<()> {
         if !self.profiled {
-            match self.profile() {
-                Ok(()) => self.profiled = true,
-                Err(err) => self.log(&format!("error: profile: {err}")),
-            }
+            self.profiled = self.retry("profile", RETRY_MAX, Self::profile);
         }
         self.onboard()?;
         let synced = self.sync();
         self.hand_over_files();
         synced?;
-        if let Err(err) = self.local() {
+        if !self.retries.contains_key("poll")
+            && let Err(err) = self.local()
+        {
             self.log(&format!("error: prompts: {err}"));
         }
         let now = self.now();
+        let turn = !self.state.pending.is_empty();
         if self
             .last_poll
-            .is_none_or(|last| now - last >= POLL_EVERY.as_secs_f64())
+            .is_none_or(|last| turn || due(now, last, POLL_EVERY))
         {
-            self.last_poll = Some(now);
-            self.poll()?;
+            let mut listed = None;
+            if self.retry("poll", POLL_MAX, |bot| {
+                listed = Some(bot.agents()?);
+                Ok(())
+            }) {
+                self.last_poll = Some(now);
+            }
+            if let Some(agents) = listed {
+                self.poll_listed(&agents)?;
+            }
+        }
+        if self.purged.is_none_or(|at| due(now, at, PURGE_EVERY)) {
+            self.purged = Some(now);
+            self.purge_files(now);
         }
         Ok(())
+    }
+
+    /// Runs `step` unless it failed lately: after a failure it waits
+    /// `RETRY_FIRST`, twice as long after each next one, `max` at most. A
+    /// failure is logged when it differs from the one before. True when
+    /// it ran and did not fail.
+    fn retry(
+        &mut self,
+        label: &str,
+        max: Duration,
+        step: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> bool {
+        let now = self.now();
+        if let Some(r) = self.retries.get(label) {
+            let wait = RETRY_FIRST
+                .saturating_mul(1 << r.failures.saturating_sub(1).min(20))
+                .min(max);
+            if !due(now, r.at, wait) {
+                return false;
+            }
+        }
+        let err = match step(self) {
+            Ok(()) => {
+                if self.retries.shift_remove(label).is_some() {
+                    self.log(&format!("{label}: ok again"));
+                }
+                return true;
+            }
+            Err(err) => err,
+        };
+        let said = err.to_string();
+        let r = self.retries.entry(label.to_owned()).or_default();
+        r.failures += 1;
+        r.at = now;
+        if r.said != said {
+            r.said = said;
+            self.log(&format!("error: {label}: {err}"));
+        }
+        false
+    }
+
+    /// Removes the files from the chat older than `FILE_TTL`, the confined
+    /// agents' too.
+    fn purge_files(&mut self, now: f64) {
+        let old = now - files::FILE_TTL.as_secs_f64();
+        let sandboxes = self.deps.agents.iter().filter_map(|s| s.sandbox.as_ref());
+        let dirs: Vec<PathBuf> = std::iter::once(self.deps.files.clone())
+            .chain(sandboxes.map(|s| s.files.clone()))
+            .collect();
+        for dir in dirs {
+            match files::purge(&dir, old) {
+                Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => self.log(&format!("error: {}: {err}", dir.display())),
+                Ok(()) => {}
+            }
+        }
     }
 
     /// Posts to the chat, or to an agent's own chat, a long text in several
@@ -467,12 +675,13 @@ impl Bot {
         }
         let mut event = None;
         let mut keys = Vec::new();
-        for (part, screen) in parts {
+        for (i, (part, screen)) in parts.into_iter().enumerate() {
             let mut formatted = md(&part);
             if let Some(screen) = &screen {
                 let _ = write!(formatted, "<pre>{}</pre>", escape(screen));
             }
-            let body: Vec<&str> = [Some(part.as_str()), screen.as_deref()]
+            let text = plain(&part);
+            let body: Vec<&str> = [Some(text.as_str()), screen.as_deref()]
                 .into_iter()
                 .flatten()
                 .filter(|x| !x.is_empty())
@@ -481,7 +690,7 @@ impl Bot {
                    "body": body.join("\n\n"),
                    "format": "org.matrix.custom.html",
                    "formatted_body": formatted});
-            let key = format!("{} {content}", to.chat.map_or("", |c| c.room.as_str()));
+            let key = format!("{} {i} {content}", to.chat.map_or("", |c| c.room.as_str()));
             let sent = self.send(&content, to.pane, to.chat, &key);
             keys.push(key);
             event = sent?;
@@ -567,18 +776,58 @@ impl Bot {
     /// What the agent did since the last prompt; a confined agent cannot
     /// tell herdr its session, so its newest session file is the one.
     fn turn(&self, a: &Agent) -> Turn {
+        self.read_turn(a).unwrap_or_default()
+    }
+
+    /// `turn`; None for an agent without a reader. An agent herdr reports
+    /// no session of is read from the newest session file of its folder;
+    /// two such agents in one folder would read one file, and get none.
+    fn read_turn(&self, a: &Agent) -> Option<Turn> {
+        let others: Vec<&Agent> = self
+            .listed
+            .iter()
+            .filter(|b| b.pane_id != a.pane_id)
+            .filter(|b| {
+                a.cwd
+                    .as_deref()
+                    .zip(b.cwd.as_deref())
+                    .is_some_and(|(x, y)| same_dir(x, y))
+            })
+            .collect();
         let settings = self.agent_settings(a);
-        match settings.and_then(|s| s.sandbox.as_ref().map(|sandbox| (&s.kind, sandbox))) {
-            Some((kind, sandbox)) => kind::confined_turn(kind, &sandbox.state),
-            None => (self.deps.answer)(a),
+        if let Some((kind, sandbox)) =
+            settings.and_then(|s| s.sandbox.as_ref().map(|sandbox| (&s.kind, sandbox)))
+        {
+            if others.is_empty() {
+                return kind::confined_turn(kind, &sandbox.state);
+            }
+            if a.session.is_none() {
+                return if others.iter().any(|b| b.session.is_none()) {
+                    None
+                } else {
+                    kind::confined_turn(kind, &sandbox.state)
+                };
+            }
+        } else if a.kind == Kind::Pi
+            && pi::reported(a).is_none()
+            && others
+                .iter()
+                .any(|b| b.kind == Kind::Pi && pi::reported(b).is_none())
+        {
+            return None;
         }
-        .unwrap_or_default()
+        (self.deps.answer)(a)
     }
 
     /// The sandbox of the agent working in the directory of `a`.
     fn sandbox(&self, a: &Agent) -> Option<&Sandbox> {
         self.agent_settings(a)?.sandbox.as_ref()
     }
+}
+
+/// True once `wait` passed since `since`, or the clock went back before it.
+fn due(now: f64, since: f64, wait: Duration) -> bool {
+    now < since || now - since >= wait.as_secs_f64()
 }
 
 /// True when two directories are one, a trailing `/` aside.
@@ -589,6 +838,24 @@ fn same_dir(a: &str, b: &str) -> bool {
 /// True for a message that says the turn has nothing to post.
 fn silent(text: &str) -> bool {
     text.trim() == SILENT
+}
+
+/// What the chat says when herdr fails to `action` ("send to") the agent
+/// `name`: the first line of what herdr said.
+fn herdr_failed(action: &str, name: &str, said: &str) -> String {
+    let cause = said.lines().next().unwrap_or_default().trim();
+    format!(
+        "Could not {action} **{name}**: {}. Is herdr running?",
+        cause.trim_end_matches('.')
+    )
+}
+
+/// What the chat says when the agent a message is for is not running.
+fn not_running(name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("**{name}** is not running; nothing was sent."),
+        None => "That agent is not running; nothing was sent.".into(),
+    }
 }
 
 /// What an agent does, as the chat says it.

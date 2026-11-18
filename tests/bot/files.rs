@@ -205,6 +205,7 @@ fn file_over_the_homeservers_limit_is_said() {
     assert_eq!(t.log_lines(), [format!("error: wA:p1 upload: {said}")]);
     assert!(t.matrix.0.borrow().uploads.is_empty());
     t.matrix.0.borrow_mut().limit = Some((1 << 20) + 1);
+    t.bot = t.make();
     t.clear_log();
     t.send_file("wA:p1", "big.bin", &vec![0; (1 << 20) + 1], None);
     t.bot.local().expect("local");
@@ -212,17 +213,108 @@ fn file_over_the_homeservers_limit_is_said() {
 }
 
 #[test]
-fn failed_upload_is_said_once() {
+fn upload_limit_is_asked_once() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    let asked = |t: &T| {
+        t.matrix
+            .calls()
+            .iter()
+            .filter(|c| c.1 == "/media/config")
+            .count()
+    };
+    t.matrix.0.borrow_mut().refuse.push("/media/config".into());
+    t.send_file("wA:p1", "a.txt", b"a", None);
+    t.bot.local().expect("local");
+    t.matrix.0.borrow_mut().refuse.clear();
+    t.advance(60.0);
+    t.send_file("wA:p1", "b.txt", b"b", None);
+    t.bot.local().expect("local");
+    t.send_file("wA:p1", "c.txt", b"c", None);
+    t.bot.local().expect("local");
+    assert_eq!(t.files_sent(None).len(), 3);
+    assert_eq!(asked(&t), 2);
+}
+
+#[test]
+fn failed_upload_is_tried_again_until_it_is_old() {
     let mut t = T::new();
     t.set("wA:p1", "idle");
     t.matrix.0.borrow_mut().refuse.push("/upload".into());
     t.send_file("wA:p1", "shot.png", &png(), None);
     t.bot.local().expect("local");
     let said = "cannot reach the homeserver: /upload failed";
-    assert_eq!(t.new_msgs(), [format!("Could not send shot.png: {said}")]);
+    assert!(t.new_msgs().is_empty(), "{:?}", t.new_msgs());
     assert_eq!(t.log_lines(), [format!("error: wA:p1 upload: {said}")]);
     assert!(t.files_sent(None).is_empty());
+    assert_eq!(fs::read_dir(t.uploads()).expect("list").count(), 2);
+    t.advance(601.0);
+    t.bot.local().expect("local");
+    assert!(t.files_sent(None).is_empty());
     assert_eq!(fs::read_dir(t.uploads()).expect("list").count(), 0);
+}
+
+#[test]
+fn failed_upload_that_gets_old_is_said_once() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.matrix.0.borrow_mut().refuse.push("/upload".into());
+    t.send_file("wA:p1", "shot.png", &png(), None);
+    t.bot.local().expect("local");
+    t.advance(300.0);
+    t.bot.local().expect("local");
+    assert!(t.new_msgs().is_empty(), "{:?}", t.new_msgs());
+    t.advance(301.0);
+    t.bot.local().expect("local");
+    t.bot.local().expect("local");
+    assert_eq!(
+        t.new_msgs(),
+        ["Could not send shot.png: cannot reach the homeserver: /upload failed"]
+    );
+}
+
+#[test]
+fn failed_upload_from_the_future_is_dropped_after_three_tries() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.matrix.0.borrow_mut().refuse.push("/upload".into());
+    let source = t.dir.path().join("a.txt");
+    fs::write(&source, "hi").expect("write");
+    let upload = herdr_matrix::inbox::Upload {
+        pane: "wA:p1".into(),
+        name: "a.txt".into(),
+        caption: None,
+        at: t.now() + 1e9,
+    };
+    let mut file = fs::File::open(&source).expect("open");
+    herdr_matrix::inbox::queue_upload(&t.uploads(), &upload, &mut file).expect("queued");
+    for _ in 0..30 {
+        t.bot.local().expect("local");
+        t.advance(10.0);
+    }
+    assert_eq!(t.matrix.0.borrow().uploads.len(), 3);
+    assert_eq!(
+        t.new_msgs(),
+        ["Could not send a.txt: cannot reach the homeserver: /upload failed"]
+    );
+    assert_eq!(fs::read_dir(t.uploads()).expect("list").count(), 0);
+}
+
+#[test]
+fn upload_survives_a_transport_failure() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.send_file("wA:p1", "a.txt", b"hi", None);
+    t.matrix.0.borrow_mut().refuse.push("/upload".into());
+    t.bot.local().expect("local");
+    t.matrix.0.borrow_mut().refuse.clear();
+    t.bot.local().expect("local");
+    assert_eq!(t.files_sent(None).len(), 0);
+    t.advance(60.0);
+    t.bot.local().expect("local");
+    assert_eq!(t.files_sent(None).len(), 1);
+    t.bot.local().expect("local");
+    assert_eq!(t.files_sent(None).len(), 1);
 }
 
 #[test]
@@ -387,8 +479,84 @@ fn agent_gone_before_its_files_go_is_said() {
     t.advance(5.0);
     t.bot.hand_over_files();
     assert!(t.herdr.did("prompt").is_empty());
-    assert_eq!(
-        t.last_msg(),
-        "The agent is not running right now; nothing was sent."
+    assert_eq!(t.last_msg(), "repo-wA is not running; nothing was sent.");
+}
+
+#[test]
+fn clock_step_back_does_not_hold_the_files() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.tell_with("shot.png", &image("mxc://x/y"));
+    t.advance(-600.0);
+    t.bot.hand_over_files();
+    assert_eq!(t.herdr.did("prompt").len(), 1);
+}
+
+#[test]
+fn old_files_are_removed_hourly() {
+    let mut t = T::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("since")
+        .as_secs_f64();
+    let ttl = herdr_matrix::files::FILE_TTL.as_secs_f64();
+    let files = t.files();
+    let sandbox = files.join("agents/nora");
+    fs::create_dir_all(&sandbox).expect("mkdir");
+    for dir in [&files, &sandbox] {
+        fs::write(dir.join("old"), "old").expect("write");
+    }
+    t.bot.deps_mut().agents = vec![herdr_matrix::bot::AgentSettings {
+        cwd: "/w/a".into(),
+        sandbox: Some(herdr_matrix::bot::Sandbox {
+            id: "nora".into(),
+            state: t.dir.path().join("state/nora/claude"),
+            uploads: t.uploads().join("nora"),
+            files: sandbox.clone(),
+        }),
+        ..herdr_matrix::bot::AgentSettings::default()
+    }];
+    t.clock.set(now + ttl - 60.0);
+    t.bot.tick().expect("tick");
+    assert!(files.join("old").exists() && sandbox.join("old").exists());
+    t.advance(120.0);
+    t.bot.tick().expect("tick");
+    assert!(files.join("old").exists(), "purged before the hour");
+    t.advance(3600.0);
+    t.bot.tick().expect("tick");
+    assert!(!files.join("old").exists() && !sandbox.join("old").exists());
+}
+
+#[test]
+fn audio_sent_as_a_file_reaches_the_agent_as_a_file() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.tell_with(
+        "song.mp3",
+        &json!({"msgtype": "m.audio", "url": "mxc://x/s"}),
     );
+    t.files_wait();
+    let prompt = t.herdr.did("prompt").last().expect("a prompt")[3].clone();
+    assert!(prompt.starts_with("See the file "), "{prompt}");
+    assert!(prompt.ends_with("-song.mp3"), "{prompt}");
+    assert!(t.heard.borrow().is_empty());
+}
+
+#[test]
+fn file_with_no_agent_attached_is_handed_over_once_one_is() {
+    let mut t = T::new();
+    t.set("wA:p1", "idle");
+    t.set("wB:p1", "idle");
+    t.tell_with("shot.png", &image("mxc://x/y"));
+    t.files_wait();
+    assert!(t.herdr.did("prompt").is_empty());
+    assert!(
+        t.last_msg()
+            .starts_with("Nothing was sent: no agent is attached.")
+    );
+    t.tell("!attach repo-wB");
+    let prompt = t.herdr.did("prompt").last().expect("a prompt").clone();
+    assert_eq!(prompt[2], "wB:p1");
+    assert!(prompt[3].ends_with("-shot.png"), "{}", prompt[3]);
+    assert_eq!(t.last_msg(), "Sent your message to repo-wB.");
 }
